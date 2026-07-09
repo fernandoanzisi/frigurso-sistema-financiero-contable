@@ -223,10 +223,10 @@ tr.total-row td{font-weight:700;border-top:2px solid var(--border);border-bottom
    1. BASE DE DATOS (IndexedDB)
 --------------------------------------------------------------------- */
 const DB_NAME = 'frigurso_contable_db';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const STORES = ['config','empresas','planCuentas','asientos','cuentasBancarias','movimientos',
   'clientes','proveedores','facturasEmitidas','facturasRecibidas','cheques','activosFijos',
-  'empleados','sueldos','impuestos','presupuesto','flujoFondos'];
+  'empleados','sueldos','impuestos','presupuesto','flujoFondos','ordenesPago'];
 
 let db;
 function openDB(){
@@ -371,7 +371,31 @@ const MODULES = {
       {key:'total',label:'Total',type:'number',required:true},
       {key:'estado',label:'Estado',type:'select',options:['Pendiente','Pagada','Vencida','Anulada'],filterable:true},
     ],
-    list:['empresaId','proveedorId','numero','fecha','total','estado']
+    list:['empresaId','proveedorId','numero','fecha','total','estado'],
+    rowActions:[{label:'💵 Generar Orden de Pago', handler:generarOrdenDePago}]
+  },
+  ordenesPago:{
+    label:'Órdenes de Pago', icon:'💵', group:'comercial',
+    fields:[
+      {key:'empresaId',label:'Empresa',type:'ref',ref:'empresas',display:'nombre',required:true,filterable:true},
+      {key:'facturaId',label:'Factura recibida',type:'ref',ref:'facturasRecibidas',display:'numero',filterable:true},
+      {key:'proveedorId',label:'Proveedor',type:'ref',ref:'proveedores',display:'nombre',required:true,filterable:true},
+      {key:'numero',label:'Número de OP',type:'text',required:true},
+      {key:'fecha',label:'Fecha',type:'date',required:true},
+      {key:'monto',label:'Monto',type:'number',required:true},
+      {key:'medioPago',label:'Medio de pago',type:'select',options:['Transferencia','Cheque','Efectivo','Otro']},
+      {key:'estado',label:'Estado',type:'select',options:['Pendiente','Pagada'],filterable:true},
+      {key:'fechaPago',label:'Fecha de pago',type:'date'},
+      {key:'notas',label:'Notas',type:'textarea'},
+    ],
+    list:['empresaId','numero','proveedorId','monto','estado'],
+    rowActions:[{label:'📧 Enviar por mail', handler:enviarOrdenPagoPorMail}],
+    afterSave: async (obj)=>{
+      if(obj.estado==='Pagada' && obj.facturaId){
+        const f = await dbGet('facturasRecibidas', obj.facturaId);
+        if(f && f.estado!=='Pagada'){ f.estado='Pagada'; await dbPut('facturasRecibidas', f); }
+      }
+    }
   },
   cheques:{
     label:'Cheques', icon:'💵', group:'valores',
@@ -576,7 +600,12 @@ async function renderCrudListado(key, mod, container){
   const filterFields = mod.fields.filter(f=>f.filterable);
   _filterState[key] = _filterState[key] || {};
   const empresaActiva = getEmpresaActiva();
-  if(mod.fields.some(f=>f.key==='empresaId') && empresaActiva) _filterState[key].empresaId = empresaActiva;
+  // Solo aplicamos el filtro de empresa activa como default la PRIMERA vez que se abre
+  // este módulo — si el usuario ya lo tocó (incluso para ponerlo en "Todas"), respetamos
+  // su elección en los re-renders siguientes (ej: después de borrar/editar un registro).
+  if(mod.fields.some(f=>f.key==='empresaId') && empresaActiva && _filterState[key].empresaId === undefined){
+    _filterState[key].empresaId = empresaActiva;
+  }
 
   let html = `<div class="row-actions">
       <button class="btn primary" id="btn-add">+ Agregar</button>
@@ -635,6 +664,13 @@ async function renderCrudListado(key, mod, container){
       tdActions.querySelector('[data-act="del"]').onclick = async ()=>{
         if(confirm('¿Eliminar este registro?')){ await dbDelete(key, rec.id); renderCrudListado(key,mod,container); }
       };
+      if(mod.rowActions){
+        mod.rowActions.forEach(ra=>{
+          const btn = el(`<button class="btn small">${ra.label}</button>`);
+          btn.onclick = ()=>ra.handler(rec, refCache);
+          tdActions.appendChild(btn);
+        });
+      }
       tr.appendChild(tdActions);
       tbody.appendChild(tr);
     });
@@ -650,12 +686,13 @@ async function loadRefCache(mod){
   return cache;
 }
 function displayValue(f, val, refCache){
-  if(val==null || val==='') return '—';
   if(f.type==='ref'){
+    if(val==null || val==='') return '<span class="badge orange" title="Este registro no quedó vinculado — revisalo y volvé a asignarlo con Editar">⚠ Sin vincular</span>';
     const list = refCache[f.ref]||[];
     const found = list.find(r=>String(r.id)===String(val));
-    return found ? escapeHtml(found[f.display]) : '—';
+    return found ? escapeHtml(found[f.display]) : '<span class="badge orange" title="Este registro no quedó vinculado — revisalo y volvé a asignarlo con Editar">⚠ Sin vincular</span>';
   }
+  if(val==null || val==='') return '—';
   if(f.type==='checkbox') return val ? '<span class="badge green">Sí</span>' : '<span class="badge gray">No</span>';
   if(f.type==='date') return fmtDate(val);
   const moneyKeys = ['monto','montoNeto','iva','total','saldoInicial','valorCompra','valorActual',
@@ -676,7 +713,8 @@ async function openForm(key, mod, existing, refCache){
   const overlay = qs('#modal-overlay');
   const box = qs('#modal-box');
   box.classList.remove('wide');
-  let html = `<h3>${existing?'Editar':'Agregar'} — ${mod.label}</h3><form id="crud-form">`;
+  const esEdicion = existing && existing.id != null;
+  let html = `<h3>${esEdicion?'Editar':'Agregar'} — ${mod.label}</h3><form id="crud-form">`;
   mod.fields.forEach(f=>{
     let val = existing ? existing[f.key] : '';
     if(!existing && f.key==='empresaId' && getEmpresaActiva()) val = getEmpresaActiva();
@@ -719,7 +757,9 @@ async function openForm(key, mod, existing, refCache){
         obj[f.key] = fd.get(f.key);
       }
     });
-    await dbPut(key, obj);
+    const savedId = await dbPut(key, obj);
+    if(obj.id == null) obj.id = savedId;
+    if(mod.afterSave) await mod.afterSave(obj);
     overlay.classList.remove('show');
     renderPage(currentPage);
   };
@@ -1414,6 +1454,72 @@ function exportFlujoPPT(flujo, fechas, totalIngresos, totalEgresos, flujoNeto, s
   } catch(err){
     alert('Hubo un error generando el PowerPoint: ' + err.message);
   }
+}
+
+/* ---------------------------------------------------------------------
+   8c. FACTURACIÓN -> ÓRDENES DE PAGO -> ENVÍO POR MAIL
+--------------------------------------------------------------------- */
+async function generarOrdenDePago(factura){
+  if(factura.estado==='Pagada'){ alert('Esta factura ya figura como Pagada.'); }
+  const prefill = {
+    empresaId: factura.empresaId,
+    facturaId: factura.id,
+    proveedorId: factura.proveedorId,
+    numero: 'OP-' + (factura.numero||factura.id),
+    fecha: todayISO(),
+    monto: factura.total,
+    medioPago: 'Transferencia',
+    estado: 'Pendiente',
+  };
+  const refCache = await loadRefCache(MODULES.ordenesPago);
+  await openForm('ordenesPago', MODULES.ordenesPago, prefill, refCache);
+}
+
+async function enviarOrdenPagoPorMail(orden){
+  const [proveedores, empresas, facturas] = await Promise.all([dbGetAll('proveedores'), dbGetAll('empresas'), dbGetAll('facturasRecibidas')]);
+  const prov = proveedores.find(p=>String(p.id)===String(orden.proveedorId));
+  const emp = empresas.find(e=>String(e.id)===String(orden.empresaId));
+  const factura = facturas.find(f=>String(f.id)===String(orden.facturaId));
+
+  const win = window.open('', '_blank');
+  if(!win){ alert('El navegador bloqueó la ventana emergente. Habilitá pop-ups para este sitio e intentá de nuevo.'); return; }
+  win.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Orden de Pago ${escapeHtml(orden.numero||'')}</title>
+    <style>
+      body{font-family:Arial,Helvetica,sans-serif;padding:40px;color:#111;}
+      h1{margin-bottom:4px;} .sub{color:#666;font-size:13px;margin-bottom:24px;}
+      table{width:100%;border-collapse:collapse;margin-top:10px;}
+      td{padding:8px 10px;border-bottom:1px solid #ddd;font-size:13px;}
+      td:first-child{color:#666;width:220px;}
+      .monto{font-size:22px;font-weight:bold;margin-top:20px;}
+      @media print{ body{padding:15px;} }
+    </style></head><body>
+    <h1>Orden de Pago Nº ${escapeHtml(orden.numero||'')}</h1>
+    <div class="sub">${emp?escapeHtml(emp.nombre):''} — generada el ${fmtDate(todayISO())}</div>
+    <table>
+      <tr><td>Proveedor</td><td>${prov?escapeHtml(prov.nombre):'—'}</td></tr>
+      <tr><td>CUIT</td><td>${prov&&prov.cuit?escapeHtml(prov.cuit):'—'}</td></tr>
+      <tr><td>Factura relacionada</td><td>${factura?escapeHtml(factura.numero):'—'}</td></tr>
+      <tr><td>Fecha de la orden</td><td>${fmtDate(orden.fecha)}</td></tr>
+      <tr><td>Medio de pago</td><td>${escapeHtml(orden.medioPago||'—')}</td></tr>
+      <tr><td>Estado</td><td>${escapeHtml(orden.estado||'—')}</td></tr>
+    </table>
+    <div class="monto">Monto a pagar: ${fmtMoney(orden.monto)}</div>
+    </body></html>`);
+  win.document.close();
+  win.focus();
+  setTimeout(()=>win.print(), 400);
+
+  const destinatario = prov && prov.email ? prov.email : '';
+  const asunto = encodeURIComponent(`Orden de Pago ${orden.numero||''} - ${emp?emp.nombre:''}`);
+  const cuerpo = encodeURIComponent(
+    `Estimado/a ${prov?prov.nombre:''},\n\n` +
+    `Adjuntamos la Orden de Pago ${orden.numero||''} correspondiente a la factura ${factura?factura.numero:''} ` +
+    `por un monto de ${fmtMoney(orden.monto)}.\n\n` +
+    `Recordá adjuntar el PDF que se generó/imprimió en la otra pestaña antes de enviar este mail.\n\n` +
+    `Saludos,\n${emp?emp.nombre:''}`
+  );
+  if(!destinatario){ alert('Este proveedor no tiene email cargado. Se generó el PDF, pero completá el destinatario manualmente en el mail que se va a abrir.'); }
+  setTimeout(()=>{ window.location.href = `mailto:${destinatario}?subject=${asunto}&body=${cuerpo}`; }, 600);
 }
 
 /* ---------------------------------------------------------------------
