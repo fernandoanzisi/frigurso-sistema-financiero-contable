@@ -9,6 +9,7 @@
 <link rel="icon" href="icon-192.png">
 <link rel="apple-touch-icon" href="icon-192.png">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pptxgenjs@3.12.0/dist/pptxgen.bundle.js"></script>
 <style>
 :root{
   --bg:#0a1420; --bg2:#0e1c2e; --card:#111f33; --card2:#152943;
@@ -222,10 +223,10 @@ tr.total-row td{font-weight:700;border-top:2px solid var(--border);border-bottom
    1. BASE DE DATOS (IndexedDB)
 --------------------------------------------------------------------- */
 const DB_NAME = 'frigurso_contable_db';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORES = ['config','empresas','planCuentas','asientos','cuentasBancarias','movimientos',
   'clientes','proveedores','facturasEmitidas','facturasRecibidas','cheques','activosFijos',
-  'empleados','sueldos','impuestos','presupuesto'];
+  'empleados','sueldos','impuestos','presupuesto','flujoFondos'];
 
 let db;
 function openDB(){
@@ -461,11 +462,14 @@ MODULES.asientos = {
 MODULES.reportesContables = {
   label:'Reportes Contables', icon:'📊', group:'contabilidad', custom:true, render:renderReportesPage
 };
+MODULES.flujoFondos = {
+  label:'Flujo de Fondos', icon:'📈', group:'tesoreria', custom:true, render:renderFlujoFondosPage
+};
 
-const GROUP_LABELS = {general:'General', contabilidad:'Contabilidad', bancos:'Bancos y Caja',
+const GROUP_LABELS = {general:'General', contabilidad:'Contabilidad', tesoreria:'Tesorería', bancos:'Bancos y Caja',
   comercial:'Comercial', valores:'Valores', activos:'Activos', personal:'Personal',
   fiscal:'Fiscal', planeamiento:'Planeamiento'};
-const GROUP_ORDER = ['general','contabilidad','bancos','comercial','valores','activos','personal','fiscal','planeamiento'];
+const GROUP_ORDER = ['general','contabilidad','tesoreria','bancos','comercial','valores','activos','personal','fiscal','planeamiento'];
 
 /* ---------------------------------------------------------------------
    4. NAVEGACIÓN
@@ -1119,6 +1123,297 @@ async function drawEstadoResultados(cont, empresaId, fecha){
       <div style="margin-top:6px;">${resultado>=0 ? '<span class="badge green">Ganancia</span>' : '<span class="badge red">Pérdida</span>'}</div>
     </div>
   `;
+}
+
+/* ---------------------------------------------------------------------
+   8b. FLUJO DE FONDOS — proyección semanal editable, multi-empresa
+--------------------------------------------------------------------- */
+function addWeeks(dateStr, n){ const d = new Date(dateStr+'T00:00:00'); d.setDate(d.getDate()+n*7); return d; }
+function fmtDateShort(d){ return d.toLocaleDateString('es-AR',{day:'2-digit',month:'2-digit'}); }
+
+async function renderFlujoFondosPage(main){
+  const empresas = await dbGetAll('empresas');
+  if(!empresas.length){ main.innerHTML = '<div class="empty">Primero cargá al menos una empresa.</div>'; return; }
+  const empresaActiva = getEmpresaActiva() || empresas[0].id;
+  main.innerHTML = `
+    <div class="filters">
+      <select id="ff-empresa">${empresas.map(e=>`<option value="${e.id}" ${String(e.id)===String(empresaActiva)?'selected':''}>${escapeHtml(e.nombre)}</option>`).join('')}</select>
+      <select id="ff-select"></select>
+      <button class="btn primary small" id="ff-nuevo">+ Nuevo Flujo</button>
+    </div>
+    <div id="ff-grid-container"></div>
+  `;
+  async function cargarListaFlujos(mantenerId){
+    const empresaId = qs('#ff-empresa').value;
+    const flujos = (await dbGetAll('flujoFondos')).filter(f=>String(f.empresaId)===String(empresaId));
+    const sel = qs('#ff-select');
+    sel.innerHTML = flujos.map(f=>`<option value="${f.id}">${escapeHtml(f.nombre)}</option>`).join('');
+    if(flujos.length){
+      const idBuscado = mantenerId!=null ? mantenerId : flujos[flujos.length-1].id;
+      sel.value = flujos.some(f=>String(f.id)===String(idBuscado)) ? idBuscado : flujos[flujos.length-1].id;
+      const flujo = flujos.find(f=>String(f.id)===String(sel.value));
+      renderFlujoGrid(qs('#ff-grid-container'), flujo);
+    } else {
+      qs('#ff-grid-container').innerHTML = '<div class="empty">No hay flujos de fondos para esta empresa todavía. Creá uno nuevo con el botón de arriba.</div>';
+    }
+  }
+  qs('#ff-empresa').onchange = ()=>cargarListaFlujos();
+  qs('#ff-select').onchange = async ()=>{
+    const flujo = await dbGet('flujoFondos', Number(qs('#ff-select').value));
+    renderFlujoGrid(qs('#ff-grid-container'), flujo);
+  };
+  qs('#ff-nuevo').onclick = async ()=>{
+    const empresaId = Number(qs('#ff-empresa').value);
+    const nuevo = {
+      empresaId, nombre:'Nuevo flujo de fondos', fechaInicio: todayISO(), semanas: 12, saldoInicial: 0,
+      ingresos:[{nombre:'Cobranzas a clientes', valores:Array(12).fill(0)}],
+      egresos:[{nombre:'Pago a proveedores', valores:Array(12).fill(0)}, {nombre:'Sueldos', valores:Array(12).fill(0)}]
+    };
+    const id = await dbPut('flujoFondos', nuevo);
+    await cargarListaFlujos(id);
+  };
+  await cargarListaFlujos();
+}
+
+function renderFlujoGrid(container, flujo){
+  let fechas, totalIngresos, totalEgresos, flujoNeto, saldoAcum;
+  let saveTimeout;
+
+  function scheduleSave(){
+    const ind = qs('#ff-save-indicator', container);
+    if(ind) ind.textContent = 'Guardando…';
+    clearTimeout(saveTimeout);
+    saveTimeout = setTimeout(async ()=>{
+      await dbPut('flujoFondos', flujo);
+      const ind2 = qs('#ff-save-indicator', container);
+      if(ind2) ind2.textContent = 'Guardado ✓';
+    }, 500);
+  }
+  function weekDates(){ const arr=[]; for(let i=0;i<flujo.semanas;i++) arr.push(addWeeks(flujo.fechaInicio,i)); return arr; }
+  function resizeArrays(){
+    [...flujo.ingresos, ...flujo.egresos].forEach(cat=>{
+      const v = cat.valores || [];
+      while(v.length < flujo.semanas) v.push(0);
+      if(v.length > flujo.semanas) v.length = flujo.semanas;
+      cat.valores = v;
+    });
+  }
+  function totalesPorSemana(categorias){
+    const totales = Array(flujo.semanas).fill(0);
+    categorias.forEach(cat=> cat.valores.forEach((v,i)=> totales[i]+=Number(v)||0));
+    return totales;
+  }
+  function recomputeTotales(){
+    fechas = weekDates();
+    totalIngresos = totalesPorSemana(flujo.ingresos);
+    totalEgresos = totalesPorSemana(flujo.egresos);
+    flujoNeto = totalIngresos.map((v,i)=>v-totalEgresos[i]);
+    saldoAcum = [];
+    let acumulado = Number(flujo.saldoInicial)||0;
+    flujoNeto.forEach(v=>{ acumulado+=v; saldoAcum.push(acumulado); });
+  }
+  function setTot(tipo, i, val){
+    const td = container.querySelector(`td[data-tot="${tipo}"][data-semana="${i}"]`);
+    if(!td) return;
+    td.textContent = fmtMoney(val);
+    td.className = moneyClass(val);
+  }
+  function actualizarTotalesDOM(){
+    recomputeTotales();
+    for(let i=0;i<flujo.semanas;i++){
+      setTot('ingresos', i, totalIngresos[i]);
+      setTot('egresos', i, totalEgresos[i]);
+      setTot('neto', i, flujoNeto[i]);
+      setTot('saldo', i, saldoAcum[i]);
+    }
+  }
+
+  function filaCategoria(cat, idx, tipo){
+    return `<tr data-tipo="${tipo}" data-idx="${idx}">
+      <td style="position:sticky;left:0;background:var(--card);z-index:1;"><input type="text" data-cat-nombre value="${escapeHtml(cat.nombre)}" style="width:160px;"></td>
+      ${cat.valores.map((v,i)=>`<td><input type="number" step="0.01" data-cat-valor data-semana="${i}" value="${v||''}" style="width:90px;"></td>`).join('')}
+      <td><button class="btn small danger" data-remove-cat>✕</button></td>
+    </tr>`;
+  }
+
+  function draw(){
+    resizeArrays();
+    recomputeTotales();
+    const colspan = flujo.semanas + 2;
+    container.innerHTML = `
+      <div class="row-actions">
+        <input type="text" id="ff-nombre-flujo" value="${escapeHtml(flujo.nombre)}" style="max-width:240px;" placeholder="Nombre del flujo">
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);">Inicio <input type="date" id="ff-fecha-inicio" value="${flujo.fechaInicio}" style="width:150px;"></label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);">Semanas <input type="number" id="ff-semanas" value="${flujo.semanas}" min="1" max="52" style="width:65px;"></label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);">Saldo inicial <input type="number" step="0.01" id="ff-saldo-inicial" value="${flujo.saldoInicial}" style="width:120px;"></label>
+        <span id="ff-save-indicator" style="color:var(--muted);font-size:12px;align-self:center;"></span>
+      </div>
+      <div class="row-actions">
+        <button class="btn" id="ff-export-excel">📥 Excel</button>
+        <button class="btn" id="ff-export-pdf">📄 PDF</button>
+        <button class="btn" id="ff-export-ppt">📑 PowerPoint</button>
+        <button class="btn danger" id="ff-eliminar-flujo">🗑️ Eliminar este flujo</button>
+      </div>
+      <div class="card table-wrap"><table class="lineas-table"><thead>
+        <tr><th style="position:sticky;left:0;background:var(--card2);z-index:2;">Categoría</th>${fechas.map((f,i)=>`<th>Sem ${i+1}<br>${fmtDateShort(f)}</th>`).join('')}<th></th></tr>
+      </thead><tbody>
+        <tr><td colspan="${colspan}" style="background:rgba(46,204,113,.08);font-weight:700;color:var(--green);">INGRESOS</td></tr>
+        ${flujo.ingresos.map((cat,idx)=>filaCategoria(cat,idx,'ingresos')).join('')}
+        <tr><td colspan="${colspan}"><button class="btn small" id="ff-add-ingreso">+ Agregar categoría de ingreso</button></td></tr>
+        <tr class="total-row"><td style="position:sticky;left:0;background:var(--card);">Total Ingresos</td>${totalIngresos.map((v,i)=>`<td data-tot="ingresos" data-semana="${i}" class="${moneyClass(v)}">${fmtMoney(v)}</td>`).join('')}<td></td></tr>
+
+        <tr><td colspan="${colspan}" style="background:rgba(231,76,60,.08);font-weight:700;color:#ff8b7d;">EGRESOS</td></tr>
+        ${flujo.egresos.map((cat,idx)=>filaCategoria(cat,idx,'egresos')).join('')}
+        <tr><td colspan="${colspan}"><button class="btn small" id="ff-add-egreso">+ Agregar categoría de egreso</button></td></tr>
+        <tr class="total-row"><td style="position:sticky;left:0;background:var(--card);">Total Egresos</td>${totalEgresos.map((v,i)=>`<td data-tot="egresos" data-semana="${i}" class="${moneyClass(v)}">${fmtMoney(v)}</td>`).join('')}<td></td></tr>
+
+        <tr class="total-row"><td style="position:sticky;left:0;background:var(--card);">Flujo Neto de la Semana</td>${flujoNeto.map((v,i)=>`<td data-tot="neto" data-semana="${i}" class="${moneyClass(v)}">${fmtMoney(v)}</td>`).join('')}<td></td></tr>
+        <tr class="total-row"><td style="position:sticky;left:0;background:var(--card);">Saldo Acumulado</td>${saldoAcum.map((v,i)=>`<td data-tot="saldo" data-semana="${i}" class="${moneyClass(v)}" style="font-weight:800;">${fmtMoney(v)}</td>`).join('')}<td></td></tr>
+      </tbody></table></div>
+    `;
+
+    qs('#ff-nombre-flujo',container).oninput = (e)=>{ flujo.nombre=e.target.value; scheduleSave(); };
+    qs('#ff-fecha-inicio',container).onchange = (e)=>{ flujo.fechaInicio=e.target.value; scheduleSave(); draw(); };
+    qs('#ff-semanas',container).onchange = (e)=>{ flujo.semanas=Math.max(1,Math.min(52,Number(e.target.value)||12)); scheduleSave(); draw(); };
+    qs('#ff-saldo-inicial',container).oninput = (e)=>{ flujo.saldoInicial=Number(e.target.value)||0; scheduleSave(); actualizarTotalesDOM(); };
+
+    container.querySelectorAll('[data-cat-nombre]').forEach(inp=>{
+      inp.oninput = (e)=>{
+        const tr = e.target.closest('tr');
+        flujo[tr.dataset.tipo][Number(tr.dataset.idx)].nombre = e.target.value;
+        scheduleSave();
+      };
+    });
+    container.querySelectorAll('[data-cat-valor]').forEach(inp=>{
+      inp.oninput = (e)=>{
+        const tr = e.target.closest('tr');
+        flujo[tr.dataset.tipo][Number(tr.dataset.idx)].valores[Number(e.target.dataset.semana)] = Number(e.target.value)||0;
+        scheduleSave();
+        actualizarTotalesDOM();
+      };
+    });
+    container.querySelectorAll('[data-remove-cat]').forEach(btn=>{
+      btn.onclick = (e)=>{
+        const tr = e.target.closest('tr');
+        flujo[tr.dataset.tipo].splice(Number(tr.dataset.idx),1);
+        scheduleSave(); draw();
+      };
+    });
+    qs('#ff-add-ingreso',container).onclick = ()=>{ flujo.ingresos.push({nombre:'Nueva categoría', valores:Array(flujo.semanas).fill(0)}); scheduleSave(); draw(); };
+    qs('#ff-add-egreso',container).onclick = ()=>{ flujo.egresos.push({nombre:'Nueva categoría', valores:Array(flujo.semanas).fill(0)}); scheduleSave(); draw(); };
+    qs('#ff-eliminar-flujo',container).onclick = async ()=>{
+      if(confirm('¿Eliminar este flujo de fondos completo?')){ await dbDelete('flujoFondos', flujo.id); renderPage(currentPage); }
+    };
+    qs('#ff-export-excel',container).onclick = ()=>exportFlujoExcel(flujo, fechas, totalIngresos, totalEgresos, flujoNeto, saldoAcum);
+    qs('#ff-export-pdf',container).onclick = ()=>exportFlujoPDF(flujo, fechas, totalIngresos, totalEgresos, flujoNeto, saldoAcum);
+    qs('#ff-export-ppt',container).onclick = ()=>exportFlujoPPT(flujo, fechas, totalIngresos, totalEgresos, flujoNeto, saldoAcum);
+  }
+  draw();
+}
+
+function exportFlujoExcel(flujo, fechas, totalIngresos, totalEgresos, flujoNeto, saldoAcum){
+  const header = ['Categoría', ...fechas.map((f,i)=>`Sem ${i+1} (${fmtDateShort(f)})`)];
+  const rows = [header];
+  rows.push(['INGRESOS']);
+  flujo.ingresos.forEach(cat=> rows.push([cat.nombre, ...cat.valores]));
+  rows.push(['Total Ingresos', ...totalIngresos]);
+  rows.push(['EGRESOS']);
+  flujo.egresos.forEach(cat=> rows.push([cat.nombre, ...cat.valores]));
+  rows.push(['Total Egresos', ...totalEgresos]);
+  rows.push(['Flujo Neto', ...flujoNeto]);
+  rows.push(['Saldo Acumulado (saldo inicial: ' + flujo.saldoInicial + ')', ...saldoAcum]);
+  const ws = XLSX.utils.aoa_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Flujo de Fondos');
+  XLSX.writeFile(wb, `Flujo_de_Fondos_${(flujo.nombre||'sin_nombre').replace(/[^\w]+/g,'_')}.xlsx`);
+}
+
+function exportFlujoPDF(flujo, fechas, totalIngresos, totalEgresos, flujoNeto, saldoAcum){
+  const minSaldo = Math.min(...saldoAcum);
+  const minIdx = saldoAcum.indexOf(minSaldo);
+  const win = window.open('', '_blank');
+  if(!win){ alert('El navegador bloqueó la ventana emergente. Habilitá pop-ups para este sitio e intentá de nuevo.'); return; }
+  win.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Flujo de Fondos - ${escapeHtml(flujo.nombre)}</title>
+    <style>
+      body{font-family:Arial,Helvetica,sans-serif;padding:30px;color:#111;}
+      h1{margin-bottom:0;} .sub{color:#666;margin-top:4px;font-size:13px;}
+      .kpis{display:flex;gap:16px;margin:20px 0;}
+      .kpi{border:1px solid #ccc;border-radius:8px;padding:12px 16px;flex:1;}
+      .kpi .num{font-size:19px;font-weight:bold;} .kpi .lbl{font-size:11px;color:#666;margin-top:3px;}
+      table{width:100%;border-collapse:collapse;font-size:10.5px;margin-top:10px;}
+      th,td{border:1px solid #ccc;padding:5px 6px;text-align:right;}
+      th:first-child,td:first-child{text-align:left;}
+      thead{background:#f0f0f0;}
+      tr.tot{font-weight:bold;background:#f7f7f7;}
+      .neg{color:#c0392b;} .pos{color:#1e8449;}
+      @media print{ body{padding:8px;} }
+    </style></head><body>
+    <h1>Flujo de Fondos</h1>
+    <div class="sub">${escapeHtml(flujo.nombre)} — generado el ${fmtDate(todayISO())}</div>
+    <div class="kpis">
+      <div class="kpi"><div class="num">${fmtMoney(flujo.saldoInicial)}</div><div class="lbl">SALDO INICIAL</div></div>
+      <div class="kpi"><div class="num ${saldoAcum[saldoAcum.length-1]<0?'neg':'pos'}">${fmtMoney(saldoAcum[saldoAcum.length-1])}</div><div class="lbl">SALDO FINAL PROYECTADO</div></div>
+      <div class="kpi"><div class="num ${minSaldo<0?'neg':'pos'}">${fmtMoney(minSaldo)}</div><div class="lbl">SALDO MÍNIMO (SEM ${minIdx+1})</div></div>
+    </div>
+    <table><thead><tr><th>Categoría</th>${fechas.map((f,i)=>`<th>Sem ${i+1}<br>${fmtDateShort(f)}</th>`).join('')}</tr></thead><tbody>
+      <tr><td colspan="${flujo.semanas+1}" style="background:#eef7f0;font-weight:bold;">INGRESOS</td></tr>
+      ${flujo.ingresos.map(cat=>`<tr><td>${escapeHtml(cat.nombre)}</td>${cat.valores.map(v=>`<td>${fmtMoney(v)}</td>`).join('')}</tr>`).join('')}
+      <tr class="tot"><td>Total Ingresos</td>${totalIngresos.map(v=>`<td>${fmtMoney(v)}</td>`).join('')}</tr>
+      <tr><td colspan="${flujo.semanas+1}" style="background:#fdeeee;font-weight:bold;">EGRESOS</td></tr>
+      ${flujo.egresos.map(cat=>`<tr><td>${escapeHtml(cat.nombre)}</td>${cat.valores.map(v=>`<td>${fmtMoney(v)}</td>`).join('')}</tr>`).join('')}
+      <tr class="tot"><td>Total Egresos</td>${totalEgresos.map(v=>`<td>${fmtMoney(v)}</td>`).join('')}</tr>
+      <tr class="tot"><td>Flujo Neto</td>${flujoNeto.map(v=>`<td class="${v<0?'neg':'pos'}">${fmtMoney(v)}</td>`).join('')}</tr>
+      <tr class="tot"><td>Saldo Acumulado</td>${saldoAcum.map(v=>`<td class="${v<0?'neg':'pos'}">${fmtMoney(v)}</td>`).join('')}</tr>
+    </tbody></table>
+    </body></html>`);
+  win.document.close();
+  win.focus();
+  setTimeout(()=>win.print(), 400);
+}
+
+function exportFlujoPPT(flujo, fechas, totalIngresos, totalEgresos, flujoNeto, saldoAcum){
+  if(typeof PptxGenJS === 'undefined'){ alert('No se pudo cargar la librería de PowerPoint (revisá tu conexión a internet e intentá de nuevo).'); return; }
+  try{
+    const pres = new PptxGenJS();
+    const minSaldo = Math.min(...saldoAcum);
+    const minIdx = saldoAcum.indexOf(minSaldo);
+
+    const s1 = pres.addSlide();
+    s1.background = {color:'0A1420'};
+    s1.addText('Flujo de Fondos', {x:0.5,y:1.6,w:9,h:1,fontSize:36,bold:true,color:'D4AF37'});
+    s1.addText(flujo.nombre||'', {x:0.5,y:2.5,w:9,h:0.6,fontSize:20,color:'FFFFFF'});
+    s1.addText(`Generado el ${fmtDate(todayISO())}`, {x:0.5,y:3.1,w:9,h:0.4,fontSize:12,color:'8BA0B8'});
+
+    const s2 = pres.addSlide();
+    s2.addText('Resumen Ejecutivo', {x:0.4,y:0.3,w:9,h:0.6,fontSize:24,bold:true,color:'0A1420'});
+    const kpis = [
+      [{text:'Indicador',options:{bold:true}}, {text:'Valor',options:{bold:true}}],
+      ['Saldo Inicial', fmtMoney(flujo.saldoInicial)],
+      ['Saldo Final Proyectado', fmtMoney(saldoAcum[saldoAcum.length-1])],
+      [`Saldo Mínimo (Semana ${minIdx+1})`, fmtMoney(minSaldo)],
+      ['Total Ingresos Proyectados', fmtMoney(totalIngresos.reduce((a,b)=>a+b,0))],
+      ['Total Egresos Proyectados', fmtMoney(totalEgresos.reduce((a,b)=>a+b,0))],
+    ];
+    s2.addTable(kpis, {x:0.4,y:1.1,w:9.2,fontSize:14,border:{type:'solid',color:'CCCCCC',pt:1},autoPage:false});
+
+    const s3 = pres.addSlide();
+    s3.addText('Evolución del Saldo Acumulado', {x:0.4,y:0.3,w:9,h:0.5,fontSize:22,bold:true,color:'0A1420'});
+    s3.addChart(pres.ChartType.line, [{
+      name:'Saldo Acumulado',
+      labels: fechas.map((f,i)=>`S${i+1}`),
+      values: saldoAcum
+    }], {x:0.4,y:1,w:9.2,h:4.2,showLegend:false,lineDataSymbol:'circle',chartColors:['D4AF37']});
+
+    const s4 = pres.addSlide();
+    s4.addText('Detalle Semanal', {x:0.4,y:0.3,w:9,h:0.5,fontSize:22,bold:true,color:'0A1420'});
+    const tablaRows = [[{text:'Semana',options:{bold:true}},{text:'Ingresos',options:{bold:true}},{text:'Egresos',options:{bold:true}},{text:'Flujo Neto',options:{bold:true}},{text:'Saldo Acum.',options:{bold:true}}]];
+    fechas.forEach((f,i)=> tablaRows.push([`Sem ${i+1}`, fmtMoney(totalIngresos[i]), fmtMoney(totalEgresos[i]), fmtMoney(flujoNeto[i]), fmtMoney(saldoAcum[i])]));
+    s4.addTable(tablaRows, {x:0.3,y:1,w:9.4,fontSize:9,border:{type:'solid',color:'CCCCCC',pt:1},autoPage:true});
+
+    pres.writeFile({fileName:`Flujo_de_Fondos_${(flujo.nombre||'sin_nombre').replace(/[^\w]+/g,'_')}.pptx`});
+  } catch(err){
+    alert('Hubo un error generando el PowerPoint: ' + err.message);
+  }
 }
 
 /* ---------------------------------------------------------------------
