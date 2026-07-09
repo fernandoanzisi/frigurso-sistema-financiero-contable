@@ -23,7 +23,7 @@ button{font-family:inherit;cursor:pointer;}
 input,select,textarea{font-family:inherit;}
 
 /* ---------- Splash ---------- */
-#splash{position:fixed;inset:0;background:radial-gradient(circle at 50% 20%,#16273d,#0a1420 70%);
+#splash,#login{position:fixed;inset:0;background:radial-gradient(circle at 50% 20%,#16273d,#0a1420 70%);
   display:flex;align-items:center;justify-content:center;z-index:999;padding:20px;}
 .splash-card{background:var(--card);border:1px solid var(--border);border-radius:20px;padding:36px 30px;
   max-width:440px;width:100%;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.5);
@@ -146,10 +146,29 @@ tr.total-row td{font-weight:700;border-top:2px solid var(--border);border-bottom
   <div class="splash-card">
     <div class="splash-emoji">💼</div>
     <h1>Frigurso Sistema Financiero Contable</h1>
-    <p>Contame el nombre del sistema (por ejemplo, el nombre del cliente o grupo empresario). Todo se guarda localmente en esta computadora, sin nube.</p>
+    <p>Contame el nombre del sistema y creá el usuario y contraseña para entrar. Todo se guarda localmente en esta computadora, sin nube.</p>
     <input id="splash-nombre" type="text" placeholder="Nombre del sistema / cliente *">
+    <input id="splash-usuario" type="text" placeholder="Usuario *" autocomplete="off">
+    <input id="splash-pass" type="password" placeholder="Contraseña *" autocomplete="new-password">
+    <input id="splash-pass2" type="password" placeholder="Repetir contraseña *" autocomplete="new-password" onkeydown="if(event.key==='Enter') finishSplash()">
+    <div id="splash-error" style="color:#ff8b7d;font-size:13px;margin:-6px 0 12px;display:none;"></div>
     <div class="splash-cta-wrap">
-      <button class="btn-primary" onclick="finishSplash()">Empezar</button>
+      <button class="btn-primary" onclick="finishSplash()">Crear acceso y empezar</button>
+    </div>
+  </div>
+</div>
+
+<!-- ================= LOGIN (sesiones siguientes) ================= -->
+<div id="login" style="display:none;">
+  <div class="splash-card">
+    <div class="splash-emoji">🔒</div>
+    <h1 id="login-titulo">Iniciar sesión</h1>
+    <p>Ingresá tu usuario y contraseña para acceder al sistema.</p>
+    <input id="login-usuario" type="text" placeholder="Usuario" autocomplete="username">
+    <input id="login-pass" type="password" placeholder="Contraseña" autocomplete="current-password" onkeydown="if(event.key==='Enter') attemptLogin()">
+    <div id="login-error" style="color:#ff8b7d;font-size:13px;margin:-6px 0 12px;display:none;"></div>
+    <div class="splash-cta-wrap">
+      <button class="btn-primary" onclick="attemptLogin()">Ingresar</button>
     </div>
   </div>
 </div>
@@ -180,6 +199,7 @@ tr.total-row td{font-weight:700;border-top:2px solid var(--border);border-bottom
       <div style="display:flex;gap:8px;">
         <button class="btn small" onclick="navGo('config')">⚙️ Config</button>
         <button class="btn small" onclick="navGo('backup')">💾 Backup</button>
+        <button class="btn small" onclick="logout()">🔒 Cerrar sesión</button>
       </div>
     </div>
     <div id="main-content"></div>
@@ -1218,14 +1238,62 @@ async function renderBackup(main){
 }
 
 /* ---------------------------------------------------------------------
-   12. ARRANQUE
+   12. AUTENTICACIÓN (usuario + contraseña, hash PBKDF2-SHA256 con salt)
+--------------------------------------------------------------------- */
+const SESSION_KEY = 'fc_sesion_activa';
+
+function bytesToHex(bytes){ return Array.from(bytes).map(b=>b.toString(16).padStart(2,'0')).join(''); }
+function hexToBytes(hex){ const arr=new Uint8Array(hex.length/2); for(let i=0;i<arr.length;i++) arr[i]=parseInt(hex.substr(i*2,2),16); return arr; }
+
+async function derivarHash(password, saltHex){
+  const enc = new TextEncoder();
+  const salt = saltHex ? hexToBytes(saltHex) : crypto.getRandomValues(new Uint8Array(16));
+  const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({name:'PBKDF2', salt, iterations:150000, hash:'SHA-256'}, keyMaterial, 256);
+  return { hash: bytesToHex(new Uint8Array(bits)), salt: bytesToHex(salt) };
+}
+async function verificarPassword(password, saltHex, hashEsperado){
+  const {hash} = await derivarHash(password, saltHex);
+  return hash === hashEsperado;
+}
+
+/* ---------------------------------------------------------------------
+   13. ARRANQUE
 --------------------------------------------------------------------- */
 async function finishSplash(){
   const nombre = qs('#splash-nombre').value.trim();
-  if(!nombre){ alert('Contame el nombre del sistema para continuar.'); return; }
-  await dbPut('config', {id:'main', nombreSistema:nombre});
+  const usuario = qs('#splash-usuario').value.trim();
+  const pass = qs('#splash-pass').value;
+  const pass2 = qs('#splash-pass2').value;
+  const errEl = qs('#splash-error');
+  errEl.style.display = 'none';
+  if(!nombre || !usuario || !pass){ errEl.textContent='Completá nombre del sistema, usuario y contraseña.'; errEl.style.display='block'; return; }
+  if(pass.length < 6){ errEl.textContent='La contraseña tiene que tener al menos 6 caracteres.'; errEl.style.display='block'; return; }
+  if(pass !== pass2){ errEl.textContent='Las contraseñas no coinciden.'; errEl.style.display='block'; return; }
+  const {hash, salt} = await derivarHash(pass);
+  await dbPut('config', {id:'main', nombreSistema:nombre, auth:{usuario, hash, salt}});
+  sessionStorage.setItem(SESSION_KEY, '1');
   qs('#splash').style.display = 'none';
   startApp();
+}
+
+async function attemptLogin(){
+  const usuario = qs('#login-usuario').value.trim();
+  const pass = qs('#login-pass').value;
+  const errEl = qs('#login-error');
+  errEl.style.display = 'none';
+  const cfg = await dbGet('config','main');
+  if(!cfg || !cfg.auth){ errEl.textContent='No hay credenciales configuradas.'; errEl.style.display='block'; return; }
+  const usuarioOk = usuario === cfg.auth.usuario;
+  const passOk = usuarioOk && await verificarPassword(pass, cfg.auth.salt, cfg.auth.hash);
+  if(!usuarioOk || !passOk){ errEl.textContent='Usuario o contraseña incorrectos.'; errEl.style.display='block'; qs('#login-pass').value=''; return; }
+  sessionStorage.setItem(SESSION_KEY, '1');
+  qs('#login').style.display = 'none';
+  startApp();
+}
+function logout(){
+  sessionStorage.removeItem(SESSION_KEY);
+  location.reload();
 }
 
 async function startApp(){
@@ -1239,11 +1307,15 @@ async function startApp(){
 async function boot(){
   await openDB();
   const cfg = await dbGet('config','main');
-  if(cfg && cfg.nombreSistema){
-    qs('#splash').style.display = 'none';
+  if(!cfg || !cfg.nombreSistema || !cfg.auth){
+    qs('#splash').style.display = 'flex';
+    return;
+  }
+  if(sessionStorage.getItem(SESSION_KEY) === '1'){
     startApp();
   } else {
-    qs('#splash').style.display = 'flex';
+    qs('#login-titulo').textContent = 'Iniciar sesión — ' + cfg.nombreSistema;
+    qs('#login').style.display = 'flex';
   }
 }
 
