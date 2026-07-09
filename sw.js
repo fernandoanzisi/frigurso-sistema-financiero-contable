@@ -1,4 +1,4 @@
-const CACHE = 'contable-v1';
+const CACHE = 'contable-v2';
 const PRECACHE = ['./', './index.html', './manifest.json'];
 
 self.addEventListener('install', e => {
