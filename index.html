@@ -395,29 +395,6 @@ const MODULES = {
     list:['empresaId','proveedorId','numero','fecha','total','moneda','totalARS','estado'],
     rowActions:[{label:'💵 Generar Orden de Pago', handler:generarOrdenDePago}]
   },
-  ordenesPago:{
-    label:'Órdenes de Pago', icon:'💵', group:'comercial',
-    fields:[
-      {key:'empresaId',label:'Empresa',type:'ref',ref:'empresas',display:'nombre',required:true,filterable:true},
-      {key:'facturaId',label:'Factura recibida',type:'ref',ref:'facturasRecibidas',display:'numero',filterable:true},
-      {key:'proveedorId',label:'Proveedor',type:'ref',ref:'proveedores',display:'nombre',required:true,filterable:true},
-      {key:'numero',label:'Número de OP',type:'text',required:true},
-      {key:'fecha',label:'Fecha',type:'date',required:true},
-      {key:'monto',label:'Monto',type:'number',required:true},
-      {key:'medioPago',label:'Medio de pago',type:'select',options:['Transferencia','Cheque','Efectivo','Otro']},
-      {key:'estado',label:'Estado',type:'select',options:['Pendiente','Pagada'],filterable:true},
-      {key:'fechaPago',label:'Fecha de pago',type:'date'},
-      {key:'notas',label:'Notas',type:'textarea'},
-    ],
-    list:['empresaId','numero','proveedorId','monto','estado'],
-    rowActions:[{label:'📧 Enviar por mail', handler:enviarOrdenPagoPorMail}],
-    afterSave: async (obj)=>{
-      if(obj.estado==='Pagada' && obj.facturaId){
-        const f = await dbGet('facturasRecibidas', obj.facturaId);
-        if(f && f.estado!=='Pagada'){ f.estado='Pagada'; await dbPut('facturasRecibidas', f); }
-      }
-    }
-  },
   cheques:{
     label:'Cheques', icon:'💵', group:'valores',
     fields:[
@@ -515,6 +492,9 @@ MODULES.flujoFondos = {
 };
 MODULES.conciliacionBancaria = {
   label:'Conciliación Bancaria', icon:'🔄', group:'bancos', custom:true, render:renderConciliacionPage
+};
+MODULES.ordenesPago = {
+  label:'Órdenes de Pago', icon:'💵', group:'comercial', custom:true, render:renderOrdenesPagoPage
 };
 MODULES.auditoria = {
   label:'Auditoría', icon:'🕵️', group:'sistema', custom:true, render:renderAuditoriaPage
@@ -1575,53 +1555,343 @@ function exportFlujoPPT(flujo, fechas, totalIngresos, totalEgresos, flujoNeto, s
 }
 
 /* ---------------------------------------------------------------------
-   8c. FACTURACIÓN -> ÓRDENES DE PAGO -> ENVÍO POR MAIL
+   8c. FACTURACIÓN -> ÓRDENES DE PAGO (multi-factura, retenciones, pago mezclado) -> PDF + MAIL
 --------------------------------------------------------------------- */
+let _prefillOrdenPago = null;
+
 async function generarOrdenDePago(factura){
-  if(factura.estado==='Pagada'){ alert('Esta factura ya figura como Pagada.'); }
-  const prefill = {
-    empresaId: factura.empresaId,
-    facturaId: factura.id,
-    proveedorId: factura.proveedorId,
-    numero: 'OP-' + (factura.numero||factura.id),
-    fecha: todayISO(),
-    monto: factura.total,
-    medioPago: 'Transferencia',
-    estado: 'Pendiente',
-  };
-  const refCache = await loadRefCache(MODULES.ordenesPago);
-  await openForm('ordenesPago', MODULES.ordenesPago, prefill, refCache);
+  if(factura.estado==='Pagada'){ alert('Esta factura ya figura como Pagada.'); return; }
+  _prefillOrdenPago = {empresaId: factura.empresaId, proveedorId: factura.proveedorId, facturaIds:[factura.id]};
+  navGo('ordenesPago');
 }
 
-async function enviarOrdenPagoPorMail(orden){
-  const [proveedores, empresas, facturas] = await Promise.all([dbGetAll('proveedores'), dbGetAll('empresas'), dbGetAll('facturasRecibidas')]);
-  const prov = proveedores.find(p=>String(p.id)===String(orden.proveedorId));
+async function renderOrdenesPagoPage(main){
+  const prefill = _prefillOrdenPago; _prefillOrdenPago = null;
+  main.innerHTML = `
+    <div class="tabs" id="op-tabs">
+      <div class="tab ${prefill?'':'active'}" data-view="listado">📋 Listado</div>
+      <div class="tab ${prefill?'active':''}" data-view="nueva">+ Nueva Orden de Pago</div>
+    </div>
+    <div id="op-content"></div>
+  `;
+  const tabsEl = qs('#op-tabs');
+  function setView(view){
+    tabsEl.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active', t.dataset.view===view));
+    if(view==='listado') renderOPListado(qs('#op-content'), main);
+    else renderOPNueva(qs('#op-content'), main, prefill);
+  }
+  tabsEl.querySelectorAll('.tab').forEach(t=> t.onclick=()=>setView(t.dataset.view));
+  setView(prefill ? 'nueva' : 'listado');
+}
+
+async function renderOPListado(cont, main){
+  const [ordenes, empresas, proveedores] = await Promise.all([dbGetAll('ordenesPago'), dbGetAll('empresas'), dbGetAll('proveedores')]);
+  cont.innerHTML = `<div class="card table-wrap"><table><thead><tr>
+      <th>Nº OP</th><th>Empresa</th><th>Proveedor</th><th>Fecha</th><th>Facturas</th><th>Neto Pagado</th><th></th>
+    </tr></thead><tbody id="op-tbody"></tbody></table></div>`;
+  const tbody = qs('#op-tbody');
+  if(!ordenes.length){ tbody.innerHTML='<tr><td colspan="7" class="empty">No hay órdenes de pago generadas todavía.</td></tr>'; return; }
+  tbody.innerHTML = ordenes.slice().reverse().map(o=>{
+    const emp = empresas.find(e=>String(e.id)===String(o.empresaId));
+    const prov = proveedores.find(p=>String(p.id)===String(o.proveedorId));
+    return `<tr>
+      <td>${escapeHtml(o.numero||'')}</td><td>${emp?escapeHtml(emp.nombre):'—'}</td><td>${prov?escapeHtml(prov.nombre):'—'}</td>
+      <td>${fmtDate(o.fecha)}</td><td>${(o.facturaIds||[]).length}</td>
+      <td class="money pos">${fmtMoney(o.totalNeto)}</td>
+      <td style="white-space:nowrap;">
+        <button class="btn small" data-op-ver="${o.id}">📄 Ver / Reenviar</button>
+        <button class="btn small danger" data-op-del="${o.id}">🗑️ Eliminar</button>
+      </td>
+    </tr>`;
+  }).join('');
+  tbody.querySelectorAll('[data-op-ver]').forEach(btn=>{
+    btn.onclick = async ()=>{ const o = await dbGet('ordenesPago', Number(btn.dataset.opVer)); await generarPDFyMailOP(o); };
+  });
+  tbody.querySelectorAll('[data-op-del]').forEach(btn=>{
+    btn.onclick = async ()=>{
+      if(!confirm('¿Eliminar esta Orden de Pago? Las facturas asociadas vuelven a estado Pendiente.')) return;
+      const o = await dbGet('ordenesPago', Number(btn.dataset.opDel));
+      for(const fid of (o.facturaIds||[])){
+        const f = await dbGet('facturasRecibidas', fid);
+        if(f){ f.estado='Pendiente'; await dbPut('facturasRecibidas', f); }
+      }
+      await dbDelete('ordenesPago', o.id);
+      await registrarAuditoria('Eliminar','Órdenes de Pago', o.id, o.numero||'');
+      renderOPListado(cont, main);
+    };
+  });
+}
+
+async function renderOPNueva(cont, main, prefill){
+  const empresas = await dbGetAll('empresas');
+  if(!empresas.length){ cont.innerHTML='<div class="empty">Primero cargá al menos una empresa.</div>'; return; }
+  const empresaInicial = (prefill && prefill.empresaId) || getEmpresaActiva() || empresas[0].id;
+
+  cont.innerHTML = `
+    <div class="card">
+      <div class="filters">
+        <select id="opn-empresa">${empresas.map(e=>`<option value="${e.id}" ${String(e.id)===String(empresaInicial)?'selected':''}>${escapeHtml(e.nombre)}</option>`).join('')}</select>
+        <select id="opn-proveedor"><option value="">-- Elegí un proveedor --</option></select>
+      </div>
+      <div id="opn-facturas"></div>
+    </div>
+    <div id="opn-retenciones-wrap" style="display:none;">
+      <div class="section-title">Retenciones (opcional)</div>
+      <div class="card">
+        <div id="opn-retenciones"></div>
+        <button type="button" class="btn small" id="opn-add-ret">+ Agregar retención</button>
+      </div>
+    </div>
+    <div id="opn-resumen"></div>
+    <div id="opn-pago-wrap" style="display:none;">
+      <div class="section-title">Medios de pago (podés mezclar cheque, transferencia y efectivo)</div>
+      <div class="card">
+        <div id="opn-mediospago"></div>
+        <button type="button" class="btn small" id="opn-add-medio">+ Agregar medio de pago</button>
+        <div class="totales-asiento" id="opn-totales-pago"></div>
+      </div>
+    </div>
+    <div class="row-actions" id="opn-actions" style="display:none;">
+      <button class="btn primary" id="opn-cerrar">✅ Cerrar Orden de Pago y generar PDF</button>
+    </div>
+  `;
+
+  let facturasSeleccionadas = [];
+  let retenciones = [];
+  let mediosPago = [];
+  let cuentasBancariasEmpresa = [];
+
+  async function cargarProveedores(){
+    const empresaId = qs('#opn-empresa').value;
+    const proveedores = (await dbGetAll('proveedores')).filter(p=>String(p.empresaId)===String(empresaId));
+    const sel = qs('#opn-proveedor');
+    sel.innerHTML = '<option value="">-- Elegí un proveedor --</option>' +
+      proveedores.map(p=>`<option value="${p.id}">${escapeHtml(p.nombre)}</option>`).join('');
+    cuentasBancariasEmpresa = (await dbGetAll('cuentasBancarias')).filter(c=>String(c.empresaId)===String(empresaId));
+  }
+  async function cargarFacturas(){
+    const empresaId = qs('#opn-empresa').value;
+    const proveedorId = qs('#opn-proveedor').value;
+    const cont2 = qs('#opn-facturas');
+    facturasSeleccionadas = [];
+    if(!proveedorId){ cont2.innerHTML=''; actualizarResumen(); return; }
+    const facturas = (await dbGetAll('facturasRecibidas')).filter(f=>
+      String(f.empresaId)===String(empresaId) && String(f.proveedorId)===String(proveedorId) &&
+      (f.estado==='Pendiente' || f.estado==='Vencida'));
+    if(!facturas.length){ cont2.innerHTML = '<div class="empty">Este proveedor no tiene facturas pendientes de pago.</div>'; actualizarResumen(); return; }
+    cont2.innerHTML = `<label style="font-size:12.5px;color:var(--muted);">Facturas a pagar (marcá una o varias)</label>
+      <div class="table-wrap"><table><thead><tr><th></th><th>Número</th><th>Fecha</th><th>Vencimiento</th><th>Total</th><th>Moneda</th></tr></thead>
+      <tbody>${facturas.map(f=>`<tr>
+        <td><input type="checkbox" data-factura="${f.id}" ${prefill&&prefill.facturaIds&&prefill.facturaIds.includes(f.id)?'checked':''}></td>
+        <td>${escapeHtml(f.numero)}</td><td>${fmtDate(f.fecha)}</td><td>${fmtDate(f.fechaVencimiento)}</td>
+        <td class="money pos">${fmtMoney(f.total)}</td><td>${escapeHtml(f.moneda||'ARS')}</td>
+      </tr>`).join('')}</tbody></table></div>`;
+    cont2.querySelectorAll('[data-factura]').forEach(chk=>{
+      const fid = Number(chk.dataset.factura);
+      if(chk.checked) facturasSeleccionadas.push(facturas.find(f=>f.id===fid));
+      chk.onchange = ()=>{
+        if(chk.checked) facturasSeleccionadas.push(facturas.find(f=>f.id===fid));
+        else facturasSeleccionadas = facturasSeleccionadas.filter(f=>f.id!==fid);
+        actualizarResumen();
+      };
+    });
+    actualizarResumen();
+  }
+
+  function totalBruto(){ return facturasSeleccionadas.reduce((s,f)=> s + (f.moneda&&f.moneda!=='ARS' ? (Number(f.total)||0)*(Number(f.cotizacion)||1) : (Number(f.total)||0)), 0); }
+  function totalRetenciones(){ return retenciones.reduce((s,r)=>s+(Number(r.monto)||0),0); }
+  function totalNeto(){ return totalBruto() - totalRetenciones(); }
+  function totalMediosPago(){ return mediosPago.reduce((s,m)=>s+(Number(m.monto)||0),0); }
+
+  function drawRetenciones(){
+    const c = qs('#opn-retenciones');
+    c.innerHTML = retenciones.map((r,idx)=>`<div class="linea-row" style="grid-template-columns:1.2fr 1fr 0.8fr 1fr auto;">
+      <select data-ridx="${idx}" data-rf="tipo">
+        ${['IIBB','Ganancias','IVA','Otro'].map(o=>`<option value="${o}" ${r.tipo===o?'selected':''}>${o}</option>`).join('')}
+      </select>
+      <input type="number" step="0.01" placeholder="Base imponible" data-ridx="${idx}" data-rf="baseImponible" value="${r.baseImponible||''}">
+      <input type="number" step="0.01" placeholder="Alícuota %" data-ridx="${idx}" data-rf="alicuota" value="${r.alicuota||''}">
+      <div style="align-self:center;font-weight:600;">${fmtMoney(r.monto||0)}</div>
+      <button type="button" class="btn small danger" data-rremove="${idx}">✕</button>
+    </div>`).join('');
+    c.querySelectorAll('select,input').forEach(inp=>{
+      inp.oninput = inp.onchange = (e)=>{
+        const idx = Number(e.target.dataset.ridx); const f = e.target.dataset.rf;
+        retenciones[idx][f] = e.target.value;
+        retenciones[idx].monto = (Number(retenciones[idx].baseImponible)||0) * (Number(retenciones[idx].alicuota)||0) / 100;
+        drawRetenciones(); actualizarResumen();
+      };
+    });
+    c.querySelectorAll('[data-rremove]').forEach(btn=>{
+      btn.onclick = ()=>{ retenciones.splice(Number(btn.dataset.rremove),1); drawRetenciones(); actualizarResumen(); };
+    });
+  }
+
+  function drawMediosPago(){
+    const c = qs('#opn-mediospago');
+    c.innerHTML = mediosPago.map((m,idx)=>{
+      const esCheque = m.tipo==='Cheque';
+      return `<div class="linea-row" style="grid-template-columns:1fr 1fr 1.6fr auto;">
+        <select data-midx="${idx}" data-mf="tipo">
+          ${['Transferencia','Cheque','Efectivo','Otro'].map(o=>`<option value="${o}" ${m.tipo===o?'selected':''}>${o}</option>`).join('')}
+        </select>
+        <input type="number" step="0.01" placeholder="Monto" data-midx="${idx}" data-mf="monto" value="${m.monto||''}">
+        ${esCheque
+          ? `<div style="display:flex;gap:6px;">
+              <input type="text" placeholder="Nº cheque" data-midx="${idx}" data-mf="chequeNumero" value="${escapeHtml(m.chequeNumero||'')}">
+              <input type="text" placeholder="Banco" data-midx="${idx}" data-mf="chequeBanco" value="${escapeHtml(m.chequeBanco||'')}">
+              <input type="date" data-midx="${idx}" data-mf="chequeFechaCobro" value="${m.chequeFechaCobro||''}">
+            </div>`
+          : `<select data-midx="${idx}" data-mf="cuentaBancariaId">
+              <option value="">-- Banco pagador --</option>
+              ${cuentasBancariasEmpresa.map(cb=>`<option value="${cb.id}" ${String(m.cuentaBancariaId)===String(cb.id)?'selected':''}>${escapeHtml(cb.nombre)}</option>`).join('')}
+            </select>`}
+        <button type="button" class="btn small danger" data-mremove="${idx}">✕</button>
+      </div>`;
+    }).join('');
+    c.querySelectorAll('select,input').forEach(inp=>{
+      inp.oninput = inp.onchange = (e)=>{
+        const idx = Number(e.target.dataset.midx); const f = e.target.dataset.mf;
+        mediosPago[idx][f] = e.target.value;
+        if(f==='tipo') drawMediosPago();
+        actualizarTotalPago();
+      };
+    });
+    c.querySelectorAll('[data-mremove]').forEach(btn=>{
+      btn.onclick = ()=>{ mediosPago.splice(Number(btn.dataset.mremove),1); drawMediosPago(); actualizarTotalPago(); };
+    });
+  }
+  function actualizarTotalPago(){
+    const total = totalMediosPago();
+    const neto = totalNeto();
+    const balanceado = Math.abs(total-neto) < 0.01;
+    qs('#opn-totales-pago').innerHTML = `
+      <div>Total medios de pago: <b>${fmtMoney(total)}</b></div>
+      <div>Neto a pagar: <b>${fmtMoney(neto)}</b></div>
+      <div class="${balanceado?'balance-ok':'balance-bad'}"><b>${balanceado?'✓ Coincide con el neto a pagar':'⚠ No coincide con el neto a pagar'}</b></div>
+    `;
+    qs('#opn-actions').style.display = facturasSeleccionadas.length ? 'flex' : 'none';
+    return balanceado;
+  }
+  function actualizarResumen(){
+    const hayFacturas = facturasSeleccionadas.length > 0;
+    qs('#opn-retenciones-wrap').style.display = hayFacturas ? 'block' : 'none';
+    qs('#opn-pago-wrap').style.display = hayFacturas ? 'block' : 'none';
+    qs('#opn-resumen').innerHTML = hayFacturas ? `<div class="totales-asiento">
+      <div>Total Bruto: <b>${fmtMoney(totalBruto())}</b></div>
+      <div>Retenciones: <b>${fmtMoney(totalRetenciones())}</b></div>
+      <div>Neto a Pagar: <b style="font-size:16px;">${fmtMoney(totalNeto())}</b></div>
+    </div>` : '';
+    actualizarTotalPago();
+  }
+
+  qs('#opn-empresa').onchange = async ()=>{ await cargarProveedores(); qs('#opn-facturas').innerHTML=''; facturasSeleccionadas=[]; retenciones=[]; mediosPago=[]; drawRetenciones(); drawMediosPago(); actualizarResumen(); };
+  qs('#opn-proveedor').onchange = cargarFacturas;
+  qs('#opn-add-ret').onclick = ()=>{ retenciones.push({tipo:'IIBB', baseImponible:totalBruto(), alicuota:0, monto:0}); drawRetenciones(); actualizarResumen(); };
+  qs('#opn-add-medio').onclick = ()=>{ mediosPago.push({tipo:'Transferencia', monto:0, cuentaBancariaId:''}); drawMediosPago(); actualizarTotalPago(); };
+
+  qs('#opn-cerrar').onclick = async ()=>{
+    if(!facturasSeleccionadas.length){ alert('Seleccioná al menos una factura.'); return; }
+    if(!mediosPago.length){ alert('Agregá al menos un medio de pago.'); return; }
+    const balanceado = actualizarTotalPago();
+    if(!balanceado){ alert('El total de los medios de pago tiene que coincidir con el Neto a Pagar.'); return; }
+
+    const empresaId = Number(qs('#opn-empresa').value);
+    const proveedorId = Number(qs('#opn-proveedor').value);
+    const numero = 'OP-' + Date.now().toString().slice(-8);
+
+    for(const m of mediosPago){
+      if(m.tipo==='Cheque'){
+        const chequeId = await dbPut('cheques', {
+          empresaId, tipo:'Emitido', numero:m.chequeNumero||'', banco:m.chequeBanco||'',
+          libradorBeneficiario:'', fechaEmision:todayISO(), fechaCobro:m.chequeFechaCobro||'',
+          monto:Number(m.monto)||0, estado:'Entregado'
+        });
+        m.chequeId = chequeId;
+      } else if(m.cuentaBancariaId){
+        await dbPut('movimientos', {
+          empresaId, cuentaId:Number(m.cuentaBancariaId), fecha:todayISO(), tipo:'Egreso',
+          categoria:'Pago a proveedores', concepto:`${numero} — pago a proveedor`, monto:Number(m.monto)||0, conciliado:false
+        });
+      }
+    }
+
+    const orden = {
+      empresaId, proveedorId, numero, fecha: todayISO(),
+      facturaIds: facturasSeleccionadas.map(f=>f.id),
+      totalBruto: totalBruto(),
+      retenciones: retenciones.map(r=>({tipo:r.tipo, baseImponible:Number(r.baseImponible)||0, alicuota:Number(r.alicuota)||0, monto:Number(r.monto)||0})),
+      totalRetenciones: totalRetenciones(),
+      totalNeto: totalNeto(),
+      mediosPago: mediosPago.map(m=>({tipo:m.tipo, monto:Number(m.monto)||0, cuentaBancariaId:m.cuentaBancariaId?Number(m.cuentaBancariaId):null, chequeId:m.chequeId||null, chequeNumero:m.chequeNumero||'', chequeBanco:m.chequeBanco||''})),
+      estado:'Pagada', fechaPago: todayISO(), notas:''
+    };
+    const idOrden = await dbPut('ordenesPago', orden);
+    orden.id = idOrden;
+
+    for(const f of facturasSeleccionadas){
+      f.estado = 'Pagada';
+      await dbPut('facturasRecibidas', f);
+    }
+    await registrarAuditoria('Crear', 'Órdenes de Pago', idOrden, `${numero} — ${fmtMoney(orden.totalNeto)}`);
+
+    await generarPDFyMailOP(orden);
+    renderOrdenesPagoPage(main);
+  };
+
+  await cargarProveedores();
+  drawRetenciones();
+  drawMediosPago();
+  if(prefill && prefill.proveedorId){ qs('#opn-proveedor').value = prefill.proveedorId; await cargarFacturas(); }
+}
+
+async function generarPDFyMailOP(orden){
+  const [empresas, proveedores, facturas] = await Promise.all([dbGetAll('empresas'), dbGetAll('proveedores'), dbGetAll('facturasRecibidas')]);
   const emp = empresas.find(e=>String(e.id)===String(orden.empresaId));
-  const factura = facturas.find(f=>String(f.id)===String(orden.facturaId));
+  const prov = proveedores.find(p=>String(p.id)===String(orden.proveedorId));
+  const facturasOrden = (orden.facturaIds||[]).map(id=>facturas.find(f=>String(f.id)===String(id))).filter(Boolean);
 
   const win = window.open('', '_blank');
   if(!win){ alert('El navegador bloqueó la ventana emergente. Habilitá pop-ups para este sitio e intentá de nuevo.'); return; }
   win.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Orden de Pago ${escapeHtml(orden.numero||'')}</title>
     <style>
-      body{font-family:Arial,Helvetica,sans-serif;padding:40px;color:#111;}
-      h1{margin-bottom:4px;} .sub{color:#666;font-size:13px;margin-bottom:24px;}
-      table{width:100%;border-collapse:collapse;margin-top:10px;}
-      td{padding:8px 10px;border-bottom:1px solid #ddd;font-size:13px;}
-      td:first-child{color:#666;width:220px;}
-      .monto{font-size:22px;font-weight:bold;margin-top:20px;}
-      @media print{ body{padding:15px;} }
+      body{font-family:Arial,Helvetica,sans-serif;padding:36px;color:#111;}
+      h1{margin-bottom:4px;} h2{font-size:15px;margin:24px 0 8px;border-bottom:2px solid #ddd;padding-bottom:4px;}
+      .sub{color:#666;font-size:13px;margin-bottom:18px;}
+      table{width:100%;border-collapse:collapse;margin-top:6px;font-size:12px;}
+      th,td{border:1px solid #ddd;padding:6px 8px;text-align:left;}
+      th{background:#f5f5f5;}
+      .monto{font-size:19px;font-weight:bold;margin-top:16px;}
+      .infobox td{border:none;padding:3px 8px;}
+      .infobox td:first-child{color:#666;width:180px;}
+      @media print{ body{padding:12px;} }
     </style></head><body>
     <h1>Orden de Pago Nº ${escapeHtml(orden.numero||'')}</h1>
-    <div class="sub">${emp?escapeHtml(emp.nombre):''} — generada el ${fmtDate(todayISO())}</div>
-    <table>
+    <div class="sub">${emp?escapeHtml(emp.nombre):''} — generada el ${fmtDate(orden.fecha)}</div>
+    <table class="infobox">
       <tr><td>Proveedor</td><td>${prov?escapeHtml(prov.nombre):'—'}</td></tr>
       <tr><td>CUIT</td><td>${prov&&prov.cuit?escapeHtml(prov.cuit):'—'}</td></tr>
-      <tr><td>Factura relacionada</td><td>${factura?escapeHtml(factura.numero):'—'}</td></tr>
-      <tr><td>Fecha de la orden</td><td>${fmtDate(orden.fecha)}</td></tr>
-      <tr><td>Medio de pago</td><td>${escapeHtml(orden.medioPago||'—')}</td></tr>
-      <tr><td>Estado</td><td>${escapeHtml(orden.estado||'—')}</td></tr>
     </table>
-    <div class="monto">Monto a pagar: ${fmtMoney(orden.monto)}</div>
+
+    <h2>Facturas incluidas</h2>
+    <table><thead><tr><th>Número</th><th>Fecha</th><th>Total</th></tr></thead><tbody>
+      ${facturasOrden.map(f=>`<tr><td>${escapeHtml(f.numero)}</td><td>${fmtDate(f.fecha)}</td><td>${fmtMoney(f.total)}</td></tr>`).join('')}
+    </tbody></table>
+
+    ${orden.retenciones && orden.retenciones.length ? `
+    <h2>Retenciones practicadas (certificado)</h2>
+    <table><thead><tr><th>Tipo</th><th>Base imponible</th><th>Alícuota</th><th>Monto retenido</th></tr></thead><tbody>
+      ${orden.retenciones.map(r=>`<tr><td>${escapeHtml(r.tipo)}</td><td>${fmtMoney(r.baseImponible)}</td><td>${r.alicuota}%</td><td>${fmtMoney(r.monto)}</td></tr>`).join('')}
+    </tbody></table>` : ''}
+
+    <h2>Medios de pago</h2>
+    <table><thead><tr><th>Tipo</th><th>Detalle</th><th>Monto</th></tr></thead><tbody>
+      ${(orden.mediosPago||[]).map(m=>`<tr><td>${escapeHtml(m.tipo)}</td>
+        <td>${m.tipo==='Cheque' ? `Cheque Nº ${escapeHtml(m.chequeNumero||'')} — ${escapeHtml(m.chequeBanco||'')}` : '—'}</td>
+        <td>${fmtMoney(m.monto)}</td></tr>`).join('')}
+    </tbody></table>
+
+    <div class="monto">Total Bruto: ${fmtMoney(orden.totalBruto)} — Retenciones: ${fmtMoney(orden.totalRetenciones)} — Neto Pagado: ${fmtMoney(orden.totalNeto)}</div>
     </body></html>`);
   win.document.close();
   win.focus();
@@ -1631,8 +1901,8 @@ async function enviarOrdenPagoPorMail(orden){
   const asunto = encodeURIComponent(`Orden de Pago ${orden.numero||''} - ${emp?emp.nombre:''}`);
   const cuerpo = encodeURIComponent(
     `Estimado/a ${prov?prov.nombre:''},\n\n` +
-    `Adjuntamos la Orden de Pago ${orden.numero||''} correspondiente a la factura ${factura?factura.numero:''} ` +
-    `por un monto de ${fmtMoney(orden.monto)}.\n\n` +
+    `Adjuntamos la Orden de Pago ${orden.numero||''} por un total neto de ${fmtMoney(orden.totalNeto)}` +
+    (orden.totalRetenciones ? `, incluyendo el certificado de retenciones por ${fmtMoney(orden.totalRetenciones)}.\n\n` : `.\n\n`) +
     `Recordá adjuntar el PDF que se generó/imprimió en la otra pestaña antes de enviar este mail.\n\n` +
     `Saludos,\n${emp?emp.nombre:''}`
   );
