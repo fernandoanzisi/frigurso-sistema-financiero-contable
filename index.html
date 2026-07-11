@@ -2167,7 +2167,7 @@ async function renderBackup(main){
         <button class="btn primary" id="btn-backup">💾 Descargar backup completo (JSON)</button>
       </div>
       <div class="field" style="margin-top:10px;">
-        <label>Restaurar desde backup</label>
+        <label>Sumar backup de otro dispositivo (no borra lo que ya tenés)</label>
         <input type="file" id="file-restore" accept=".json">
       </div>
     </div>`;
@@ -2183,17 +2183,48 @@ async function renderBackup(main){
   qs('#file-restore').onchange = async (e)=>{
     const file = e.target.files[0];
     if(!file) return;
-    if(!confirm('Esto va a REEMPLAZAR todos los datos actuales por los del backup. ¿Continuar?')) return;
+    if(!confirm('Esto va a SUMAR a lo que ya tenés los registros nuevos de ese backup. No se borra ni se pisa nada existente (tampoco tu usuario/contraseña de acceso). ¿Continuar?')) return;
     const text = await file.text();
     const dump = JSON.parse(text);
-    for(const s of STORES){
-      await dbClear(s);
-      for(const rec of (dump[s]||[])) await dbPut(s, rec);
-    }
-    alert('Backup restaurado con éxito.');
+    const agregados = await fusionarBackup(dump);
+    alert(agregados>0 ? 'Se sumaron '+agregados+' registros nuevos.' : 'Ya tenías todo lo de ese backup.');
     boot();
   };
 }
+// Convierte un valor a texto canonico (claves ordenadas) para comparar contenido sin importar el orden de propiedades.
+function _stableStringify(obj){
+  if(obj===null||typeof obj!=='object') return JSON.stringify(obj);
+  if(Array.isArray(obj)) return '['+obj.map(_stableStringify).join(',')+']';
+  const keys=Object.keys(obj).sort();
+  return '{'+keys.map(k=>JSON.stringify(k)+':'+_stableStringify(obj[k])).join(',')+'}';
+}
+// Los ids de estos stores son autoIncrement por dispositivo -- el mismo numero de id en dos
+// backups distintos NO significa el mismo registro. Por eso comparamos por CONTENIDO (todo
+// menos el id) y, si es nuevo, lo guardamos SIN el id del backup para que IndexedDB le asigne
+// uno propio y no choque con un registro local que ya use ese numero. La config (que incluye
+// el usuario/contraseña de acceso) nunca se pisa si el dispositivo ya tiene una configurada.
+async function fusionarBackup(dump){
+  let agregados=0;
+  if(dump.config && dump.config[0]){
+    const actual = await dbGet('config','main');
+    if(!actual || !actual.nombreSistema){ await dbPut('config', {...dump.config[0], id:'main'}); agregados++; }
+  }
+  for(const s of STORES){
+    if(s==='config' || !Array.isArray(dump[s])) continue;
+    const existentes = await dbGetAll(s);
+    const hashesExistentes = new Set(existentes.map(_stableStringifyRecord));
+    for(const rec of dump[s]){
+      const hash = _stableStringifyRecord(rec);
+      if(hashesExistentes.has(hash)) continue;
+      const {id, ...resto} = rec;
+      await dbPut(s, resto);
+      hashesExistentes.add(hash);
+      agregados++;
+    }
+  }
+  return agregados;
+}
+function _stableStringifyRecord(rec){ const {id, ...resto}=rec; return _stableStringify(resto); }
 
 /* ---------------------------------------------------------------------
    12. AUTENTICACIÓN (usuario + contraseña, hash PBKDF2-SHA256 con salt)
