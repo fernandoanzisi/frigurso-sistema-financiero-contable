@@ -260,6 +260,56 @@ function todayISO(){ return new Date().toISOString().slice(0,10); }
 function escapeHtml(s){ return (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 const NATURALEZA_DEUDORA = ['Activo','Egresos','Costos'];
 
+/* Códigos de entidades bancarias (BCRA) más usados — catálogo de referencia,
+   se usa como sugerencia (datalist), sigue siendo 100% editable a mano. */
+const BANCOS_ARGENTINA = [
+  {codigo:'007',nombre:'Banco Galicia'},
+  {codigo:'011',nombre:'Banco Nación'},
+  {codigo:'014',nombre:'Banco Provincia (Buenos Aires)'},
+  {codigo:'017',nombre:'BBVA Banco Francés'},
+  {codigo:'020',nombre:'Banco de la Provincia de Córdoba (Bancor)'},
+  {codigo:'027',nombre:'Banco Supervielle'},
+  {codigo:'029',nombre:'Banco Ciudad'},
+  {codigo:'034',nombre:'Banco Patagonia'},
+  {codigo:'044',nombre:'Banco Hipotecario'},
+  {codigo:'072',nombre:'Banco Santander Río'},
+  {codigo:'093',nombre:'Banco de La Pampa'},
+  {codigo:'097',nombre:'Banco de la Provincia del Neuquén'},
+  {codigo:'150',nombre:'HSBC Bank Argentina'},
+  {codigo:'191',nombre:'Banco Credicoop'},
+  {codigo:'259',nombre:'Banco Itaú'},
+  {codigo:'285',nombre:'Banco Macro'},
+  {codigo:'299',nombre:'Banco Comafi'},
+];
+
+/* Jerarquía de Plan de Cuentas (cuenta de título → cuentas imputables).
+   ordenarPorJerarquia: devuelve las cuentas ordenadas por código con su profundidad (_depth)
+   para indentar en selects/tablas. esDescendiente: para acumular saldos de hijas en el padre. */
+function ordenarPorJerarquia(cuentas){
+  const byId = {};
+  cuentas.forEach(c=>byId[c.id]=c);
+  function profundidad(c, seen){
+    seen = seen || new Set();
+    if(!c || c.cuentaPadreId==null || c.cuentaPadreId==='' || seen.has(c.id)) return 0;
+    seen.add(c.id);
+    const padre = byId[c.cuentaPadreId];
+    return padre ? 1+profundidad(padre, seen) : 0;
+  }
+  return cuentas.slice()
+    .sort((a,b)=>String(a.codigo||'').localeCompare(String(b.codigo||''), undefined, {numeric:true}))
+    .map(c=>({...c, _depth: profundidad(c)}));
+}
+function esDescendienteDe(byId, candidatoId, posiblePadreId){
+  const seen = new Set();
+  let actual = byId[candidatoId];
+  while(actual && actual.cuentaPadreId!=null && actual.cuentaPadreId!=='' && !seen.has(actual.id)){
+    seen.add(actual.id);
+    if(String(actual.cuentaPadreId)===String(posiblePadreId)) return true;
+    actual = byId[actual.cuentaPadreId];
+  }
+  return false;
+}
+
 /* Empresa activa (filtro global de contexto, guardado en localStorage) */
 function getEmpresaActiva(){ return localStorage.getItem('fc_empresa_activa') || ''; }
 function setEmpresaActiva(id){ localStorage.setItem('fc_empresa_activa', id||''); renderPage(currentPage); }
@@ -288,6 +338,10 @@ const MODULES = {
       {key:'direccion',label:'Dirección',type:'text'},
       {key:'telefono',label:'Teléfono',type:'text'},
       {key:'email',label:'Email',type:'text'},
+      {key:'cuentaProveedoresId',label:'Cta. contable Proveedores (asiento automático al cerrar una Orden de Pago)',type:'ref',ref:'planCuentas',display:'nombre'},
+      {key:'cuentaRetencionesId',label:'Cta. contable Retenciones a Depositar (asiento automático de Orden de Pago con retenciones)',type:'ref',ref:'planCuentas',display:'nombre'},
+      {key:'cuentaComprasId',label:'Cta. contable Compras (asiento automático al cargar una Factura Recibida)',type:'ref',ref:'planCuentas',display:'nombre'},
+      {key:'cuentaIVACreditoFiscalId',label:'Cta. contable IVA Crédito Fiscal (opcional, discrimina el IVA de la Factura Recibida)',type:'ref',ref:'planCuentas',display:'nombre'},
     ],
     list:['nombre','cuit','rubro']
   },
@@ -299,9 +353,12 @@ const MODULES = {
       {key:'nombre',label:'Nombre de la cuenta',type:'text',required:true},
       {key:'tipo',label:'Tipo',type:'select',options:['Activo','Pasivo','Patrimonio Neto','Ingresos','Egresos','Costos'],required:true,filterable:true},
       {key:'rubro',label:'Rubro',type:'select',options:['Corriente','No Corriente','—']},
-      {key:'imputable',label:'Imputable (se usa directo en asientos)',type:'checkbox'},
+      {key:'cuentaPadreId',label:'Familia / Cuenta de título (ej: Caja y Bancos)',type:'ref',ref:'planCuentas',display:'nombre',filterable:true},
+      {key:'imputable',label:'Imputable (se usa directo en asientos; si es de título/familia, dejar sin marcar)',type:'checkbox'},
+      {key:'naturaleza',label:'Naturaleza',type:'computed',money:false,compute:rec=>NATURALEZA_DEUDORA.includes(rec.tipo)?'Deudora':'Acreedora'},
     ],
-    list:['empresaId','codigo','nombre','tipo']
+    list:['empresaId','codigo','nombre','tipo','cuentaPadreId','naturaleza','imputable'],
+    listActions:[{label:'📚 Cargar Plan de Cuentas Básico', handler:seedPlanCuentasBasico}]
   },
   cuentasBancarias:{
     label:'Cuentas Bancarias y Caja', icon:'🏦', group:'bancos',
@@ -309,12 +366,13 @@ const MODULES = {
       {key:'empresaId',label:'Empresa',type:'ref',ref:'empresas',display:'nombre',required:true,filterable:true},
       {key:'nombre',label:'Nombre (ej: Banco Nación CC, Caja Chica)',type:'text',required:true},
       {key:'tipo',label:'Tipo',type:'select',options:['Banco','Caja'],filterable:true},
-      {key:'banco',label:'Banco',type:'text'},
+      {key:'banco',label:'Banco',type:'autocomplete',options:BANCOS_ARGENTINA.map(b=>`${b.codigo} - ${b.nombre}`)},
       {key:'numeroCuenta',label:'Número de cuenta / CBU',type:'text'},
       {key:'moneda',label:'Moneda de la cuenta',type:'select',options:['ARS','USD','EUR'],filterable:true},
       {key:'saldoInicial',label:'Saldo inicial',type:'number'},
+      {key:'cuentaContableId',label:'Cuenta contable asociada (Plan de Cuentas)',type:'ref',ref:'planCuentas',display:'nombre'},
     ],
-    list:['empresaId','nombre','tipo','banco','moneda','saldoInicial']
+    list:['empresaId','nombre','tipo','banco','moneda','saldoInicial','cuentaContableId']
   },
   movimientos:{
     label:'Movimientos Bancarios', icon:'💳', group:'bancos',
@@ -393,7 +451,8 @@ const MODULES = {
       {key:'estado',label:'Estado',type:'select',options:['Pendiente','Pagada','Vencida','Anulada'],filterable:true},
     ],
     list:['empresaId','proveedorId','numero','fecha','total','moneda','totalARS','estado'],
-    rowActions:[{label:'💵 Generar Orden de Pago', handler:generarOrdenDePago}]
+    rowActions:[{label:'💵 Generar Orden de Pago', handler:generarOrdenDePago}],
+    afterSave: generarAsientoFacturaRecibida
   },
   cheques:{
     label:'Cheques', icon:'💵', group:'valores',
@@ -648,6 +707,7 @@ async function renderCrudListado(key, mod, container){
       <button class="btn" id="btn-export">📥 Exportar Excel</button>
       <button class="btn" id="btn-import">📤 Importar Excel</button>
       <input type="file" id="file-import" accept=".xlsx,.xls,.csv" style="display:none">
+      ${(mod.listActions||[]).map((la,idx)=>`<button class="btn" id="btn-listaction-${idx}">${la.label}</button>`).join('')}
     </div>`;
 
   if(filterFields.length){
@@ -673,6 +733,9 @@ async function renderCrudListado(key, mod, container){
   qs('#btn-add',container).onclick = ()=>openForm(key, mod, null, refCache);
   qs('#btn-export',container).onclick = ()=>exportModuleExcel(key, mod, refCache);
   qs('#btn-import',container).onclick = ()=>qs('#file-import',container).click();
+  (mod.listActions||[]).forEach((la,idx)=>{
+    qs(`#btn-listaction-${idx}`,container).onclick = ()=> la.handler(()=>renderCrudListado(key,mod,container));
+  });
   qs('#file-import',container).onchange = (e)=>importModuleExcel(key, mod, e.target.files[0], ()=>renderCrudListado(key,mod,container));
 
   container.querySelectorAll('[data-filter]').forEach(sel=>{
@@ -728,7 +791,8 @@ async function loadRefCache(mod){
 function displayValue(f, val, refCache, rec){
   if(f.type==='computed'){
     const v = f.compute(rec);
-    return v==null ? '—' : `<span class="${moneyClass(v)}">${fmtMoney(v)}</span>`;
+    if(v==null) return '—';
+    return f.money===false ? escapeHtml(v) : `<span class="${moneyClass(v)}">${fmtMoney(v)}</span>`;
   }
   if(f.type==='ref'){
     if(val==null || val==='') return '<span class="badge orange" title="Este registro no quedó vinculado — revisalo y volvé a asignarlo con Editar">⚠ Sin vincular</span>';
@@ -774,6 +838,10 @@ async function openForm(key, mod, existing, refCache){
         list.map(r=>`<option value="${r.id}" ${String(val)===String(r.id)?'selected':''}>${escapeHtml(r[f.display])}</option>`).join('') + `</select>`;
     } else if(f.type==='checkbox'){
       html += `<label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" name="${f.key}" ${val?'checked':''}> Sí</label>`;
+    } else if(f.type==='autocomplete'){
+      const dlId = `dl-${f.key}`;
+      html += `<input type="text" name="${f.key}" list="${dlId}" value="${val!=null?escapeHtml(val):''}" ${f.required?'required':''}>
+        <datalist id="${dlId}">${(f.options||[]).map(o=>`<option value="${escapeHtml(o)}">`).join('')}</datalist>`;
     } else {
       html += `<input type="${f.type}" name="${f.key}" value="${val!=null?escapeHtml(val):''}" ${f.required?'required':''}>`;
     }
@@ -866,12 +934,182 @@ async function importModuleExcel(key, mod, file, cb){
   if(cb) cb();
 }
 
+/* ------------------- Plan de Cuentas básico (semilla editable) -------------------
+   Crea una estructura jerárquica estándar (Título/Imputable + Naturaleza Deudora/
+   Acreedora) para la empresa activa, al estilo de un plan de cuentas de SAP.
+   Es sólo un punto de partida: quedan como registros normales, 100% editables/
+   borrables desde el CRUD. Es idempotente por código: si una cuenta con ese
+   código ya existe para la empresa, no la duplica — la reutiliza como padre. */
+async function seedPlanCuentasBasico(refresh){
+  const empresaId = getEmpresaActiva();
+  if(!empresaId){ alert('Elegí una empresa activa (selector arriba) antes de cargar el plan de cuentas básico.'); return; }
+  if(!confirm('Esto crea la estructura básica del Plan de Cuentas (Activo, Pasivo, Patrimonio Neto, Ingresos, Egresos, Costos, con Caja y Bancos y algunos bancos con su código) para la empresa activa. Las cuentas que ya tengas cargadas con el mismo código no se duplican. ¿Continuar?')) return;
+
+  const existentes = (await dbGetAll('planCuentas')).filter(c=>String(c.empresaId)===String(empresaId));
+  const porCodigo = {};
+  existentes.forEach(c=>{ if(c.codigo) porCodigo[c.codigo] = c; });
+
+  async function crear(codigo, nombre, tipo, rubro, padreId, imputable){
+    if(porCodigo[codigo]) return porCodigo[codigo].id;
+    const obj = {empresaId, codigo, nombre, tipo, rubro: rubro||'—', cuentaPadreId: padreId||null, imputable: !!imputable};
+    obj.id = await dbPut('planCuentas', obj);
+    porCodigo[codigo] = obj;
+    return obj.id;
+  }
+
+  const activoId = await crear('1','ACTIVO','Activo','—',null,false);
+  const activoCteId = await crear('1.1','ACTIVO CORRIENTE','Activo','Corriente',activoId,false);
+  const cajaBancosId = await crear('1.1.01','Caja y Bancos','Activo','Corriente',activoCteId,false);
+  await crear('1.1.01.001','Caja / Efectivo','Activo','Corriente',cajaBancosId,true);
+  const bancosId = await crear('1.1.01.002','Bancos','Activo','Corriente',cajaBancosId,false);
+  await crear('1.1.01.002.007','007 - Banco Galicia','Activo','Corriente',bancosId,true);
+  await crear('1.1.01.002.011','011 - Banco Nación','Activo','Corriente',bancosId,true);
+  await crear('1.1.01.002.034','034 - Banco Patagonia','Activo','Corriente',bancosId,true);
+  await crear('1.1.01.002.097','097 - Banco Provincia del Neuquén','Activo','Corriente',bancosId,true);
+
+  const creditosId = await crear('1.1.02','Créditos por Ventas','Activo','Corriente',activoCteId,false);
+  await crear('1.1.02.001','Deudores por Ventas','Activo','Corriente',creditosId,true);
+  await crear('1.1.02.002','Documentos a Cobrar','Activo','Corriente',creditosId,true);
+
+  const otrosCredId = await crear('1.1.03','Otros Créditos','Activo','Corriente',activoCteId,false);
+  await crear('1.1.03.001','IVA Crédito Fiscal','Activo','Corriente',otrosCredId,true);
+  await crear('1.1.03.002','Anticipo de Impuestos','Activo','Corriente',otrosCredId,true);
+  await crear('1.1.03.003','Otros Deudores','Activo','Corriente',otrosCredId,true);
+
+  const bienesCambioId = await crear('1.1.04','Bienes de Cambio','Activo','Corriente',activoCteId,false);
+  await crear('1.1.04.001','Mercaderías','Activo','Corriente',bienesCambioId,true);
+
+  const activoNoCteId = await crear('1.2','ACTIVO NO CORRIENTE','Activo','No Corriente',activoId,false);
+  const bienesUsoId = await crear('1.2.01','Bienes de Uso','Activo','No Corriente',activoNoCteId,false);
+  await crear('1.2.01.001','Muebles y Útiles','Activo','No Corriente',bienesUsoId,true);
+  await crear('1.2.01.002','Rodados','Activo','No Corriente',bienesUsoId,true);
+  await crear('1.2.01.003','Amortización Acumulada Bienes de Uso','Activo','No Corriente',bienesUsoId,true);
+
+  const pasivoId = await crear('2','PASIVO','Pasivo','—',null,false);
+  const pasivoCteId = await crear('2.1','PASIVO CORRIENTE','Pasivo','Corriente',pasivoId,false);
+  const deudasComId = await crear('2.1.01','Deudas Comerciales','Pasivo','Corriente',pasivoCteId,false);
+  await crear('2.1.01.001','Proveedores','Pasivo','Corriente',deudasComId,true);
+  await crear('2.1.01.002','Documentos a Pagar','Pasivo','Corriente',deudasComId,true);
+
+  const deudasBancId = await crear('2.1.02','Deudas Bancarias y Financieras','Pasivo','Corriente',pasivoCteId,false);
+  await crear('2.1.02.001','Préstamos Bancarios','Pasivo','Corriente',deudasBancId,true);
+  await crear('2.1.02.002','Descubierto en Cuenta Corriente','Pasivo','Corriente',deudasBancId,true);
+
+  const cargasFiscId = await crear('2.1.03','Cargas Fiscales','Pasivo','Corriente',pasivoCteId,false);
+  await crear('2.1.03.001','IVA Débito Fiscal','Pasivo','Corriente',cargasFiscId,true);
+  await crear('2.1.03.002','Retenciones a Depositar','Pasivo','Corriente',cargasFiscId,true);
+  await crear('2.1.03.003','Ingresos Brutos a Pagar','Pasivo','Corriente',cargasFiscId,true);
+
+  const cargasSocId = await crear('2.1.04','Cargas Sociales y Remuneraciones','Pasivo','Corriente',pasivoCteId,false);
+  await crear('2.1.04.001','Sueldos a Pagar','Pasivo','Corriente',cargasSocId,true);
+  await crear('2.1.04.002','Cargas Sociales a Pagar','Pasivo','Corriente',cargasSocId,true);
+
+  const pasivoNoCteId = await crear('2.2','PASIVO NO CORRIENTE','Pasivo','No Corriente',pasivoId,false);
+  await crear('2.2.01','Deudas Bancarias Largo Plazo','Pasivo','No Corriente',pasivoNoCteId,true);
+
+  const pnId = await crear('3','PATRIMONIO NETO','Patrimonio Neto','—',null,false);
+  await crear('3.01','Capital Social','Patrimonio Neto','—',pnId,true);
+  await crear('3.02','Resultados Acumulados','Patrimonio Neto','—',pnId,true);
+  await crear('3.03','Resultado del Ejercicio','Patrimonio Neto','—',pnId,true);
+
+  const ingId = await crear('4','INGRESOS','Ingresos','—',null,false);
+  await crear('4.01','Ventas','Ingresos','—',ingId,true);
+  await crear('4.02','Intereses Ganados','Ingresos','—',ingId,true);
+  await crear('4.03','Otros Ingresos','Ingresos','—',ingId,true);
+
+  const egrId = await crear('5','EGRESOS','Egresos','—',null,false);
+  await crear('5.01','Gastos de Administración','Egresos','—',egrId,true);
+  await crear('5.02','Gastos de Comercialización','Egresos','—',egrId,true);
+  await crear('5.03','Gastos Financieros','Egresos','—',egrId,true);
+  await crear('5.04','Impuestos y Tasas','Egresos','—',egrId,true);
+
+  const cosId = await crear('6','COSTOS','Costos','—',null,false);
+  await crear('6.01','Costo de Mercadería Vendida','Costos','—',cosId,true);
+
+  await registrarAuditoria('Crear', 'Plan de Cuentas', empresaId, 'Carga de plan de cuentas básico');
+  alert('Listo. Se cargó el plan de cuentas básico (las cuentas que ya tenías con el mismo código se dejaron como estaban).');
+  if(refresh) refresh();
+}
+
+/* ------------------- Asientos automáticos (subledger → Libro Diario) -------------------
+   Sólo se generan si la empresa tiene configuradas sus cuentas contables por defecto
+   (Empresas → editar). Si falta configuración o algo no cierra, no se genera nada y
+   el registro operativo (OP / Factura) se guarda igual, como si esto no existiera —
+   es un agregado 100% opcional y no bloqueante. */
+async function generarAsientoOrdenDePago(orden, empresa){
+  if(!empresa || !empresa.cuentaProveedoresId) return null;
+  if((orden.mediosPago||[]).some(m=>m.tipo==='Cheque')) return null; // los cheques se contabilizan aparte
+  const cuentas = await dbGetAll('planCuentas');
+  const cuentaProv = cuentas.find(c=>String(c.id)===String(empresa.cuentaProveedoresId) && String(c.empresaId)===String(empresa.id));
+  if(!cuentaProv) return null;
+  let cuentaRet = null;
+  if(orden.totalRetenciones){
+    if(!empresa.cuentaRetencionesId) return null;
+    cuentaRet = cuentas.find(c=>String(c.id)===String(empresa.cuentaRetencionesId) && String(c.empresaId)===String(empresa.id));
+    if(!cuentaRet) return null;
+  }
+  const cuentasBancarias = await dbGetAll('cuentasBancarias');
+  const lineas = [{cuentaId:cuentaProv.id, centroCostoId:null, debe:orden.totalBruto, haber:0}];
+  if(cuentaRet && orden.totalRetenciones){
+    lineas.push({cuentaId:cuentaRet.id, centroCostoId:null, debe:0, haber:orden.totalRetenciones});
+  }
+  for(const m of (orden.mediosPago||[])){
+    const cb = cuentasBancarias.find(c=>String(c.id)===String(m.cuentaBancariaId));
+    if(!cb || !cb.cuentaContableId) return null;
+    const cuentaBanco = cuentas.find(c=>String(c.id)===String(cb.cuentaContableId) && String(c.empresaId)===String(empresa.id));
+    if(!cuentaBanco) return null;
+    lineas.push({cuentaId:cuentaBanco.id, centroCostoId:null, debe:0, haber:Number(m.monto)||0});
+  }
+  const totalDebe = lineas.reduce((s,l)=>s+l.debe,0);
+  const totalHaber = lineas.reduce((s,l)=>s+l.haber,0);
+  if(totalDebe<=0 || Math.abs(totalDebe-totalHaber)>0.01) return null;
+  const idAsiento = await dbPut('asientos', {
+    empresaId:empresa.id, fecha:orden.fecha, descripcion:`${orden.numero} — pago a proveedor`,
+    lineas, origen:'ordenesPago', origenId:orden.id
+  });
+  await registrarAuditoria('Crear', 'Libro Diario', idAsiento, `Generado automáticamente desde Orden de Pago ${orden.numero}`);
+  return idAsiento;
+}
+
+async function generarAsientoFacturaRecibida(factura){
+  if(factura.asientoGeneradoId) return; // ya se generó una vez; no se regenera en ediciones posteriores
+  const empresa = await dbGet('empresas', factura.empresaId);
+  if(!empresa || !empresa.cuentaComprasId || !empresa.cuentaProveedoresId) return;
+  const cuentas = await dbGetAll('planCuentas');
+  const cuentaCompras = cuentas.find(c=>String(c.id)===String(empresa.cuentaComprasId) && String(c.empresaId)===String(empresa.id));
+  const cuentaProv = cuentas.find(c=>String(c.id)===String(empresa.cuentaProveedoresId) && String(c.empresaId)===String(empresa.id));
+  if(!cuentaCompras || !cuentaProv) return;
+  const cot = (factura.moneda && factura.moneda!=='ARS') ? (Number(factura.cotizacion)||1) : 1;
+  const totalARS = (Number(factura.total)||0)*cot;
+  const ivaARS = (Number(factura.iva)||0)*cot;
+  if(totalARS<=0) return;
+  const cuentaIVA = empresa.cuentaIVACreditoFiscalId
+    ? cuentas.find(c=>String(c.id)===String(empresa.cuentaIVACreditoFiscalId) && String(c.empresaId)===String(empresa.id))
+    : null;
+  const lineas = [];
+  if(cuentaIVA && ivaARS>0 && ivaARS<totalARS){
+    lineas.push({cuentaId:cuentaCompras.id, centroCostoId:null, debe:totalARS-ivaARS, haber:0});
+    lineas.push({cuentaId:cuentaIVA.id, centroCostoId:null, debe:ivaARS, haber:0});
+  } else {
+    lineas.push({cuentaId:cuentaCompras.id, centroCostoId:null, debe:totalARS, haber:0});
+  }
+  lineas.push({cuentaId:cuentaProv.id, centroCostoId:null, debe:0, haber:totalARS});
+  const idAsiento = await dbPut('asientos', {
+    empresaId:empresa.id, fecha:factura.fecha, descripcion:`Factura ${factura.numero} — compra`,
+    lineas, origen:'facturasRecibidas', origenId:factura.id
+  });
+  await registrarAuditoria('Crear', 'Libro Diario', idAsiento, `Generado automáticamente desde Factura Recibida ${factura.numero}`);
+  factura.asientoGeneradoId = idAsiento;
+  await dbPut('facturasRecibidas', factura);
+}
+
 /* ---------------------------------------------------------------------
    6. MOTOR CONTABLE — cálculo de saldos por cuenta (partida doble)
 --------------------------------------------------------------------- */
 async function computeSaldosCuentas(empresaId, fechaHasta){
   const [cuentas, asientos] = await Promise.all([dbGetAll('planCuentas'), dbGetAll('asientos')]);
-  const cuentasEmpresa = cuentas.filter(c=>String(c.empresaId)===String(empresaId));
+  const cuentasEmpresa = ordenarPorJerarquia(cuentas.filter(c=>String(c.empresaId)===String(empresaId)));
+  const byId = {}; cuentasEmpresa.forEach(c=>byId[c.id]=c);
   const asientosEmpresa = asientos.filter(a=>String(a.empresaId)===String(empresaId) && (!fechaHasta || (a.fecha||'')<=fechaHasta));
   const map = {};
   asientosEmpresa.forEach(a=>{
@@ -881,11 +1119,22 @@ async function computeSaldosCuentas(empresaId, fechaHasta){
       map[l.cuentaId].haber += Number(l.haber)||0;
     });
   });
-  return cuentasEmpresa.map(c=>{
+  // "propio": lo que se contabilizó directo en esa cuenta. "Acum": propio + todas las cuentas
+  // hijas (para que una cuenta de título como "Caja y Bancos" muestre el total de familia).
+  const base = cuentasEmpresa.map(c=>{
     const m = map[c.id] || {debe:0, haber:0};
     const deudora = NATURALEZA_DEUDORA.includes(c.tipo);
     const saldo = deudora ? (m.debe - m.haber) : (m.haber - m.debe);
-    return {cuenta:c, debe:m.debe, haber:m.haber, saldo, deudora};
+    return {cuenta:c, depth:c._depth, debe:m.debe, haber:m.haber, saldo, deudora};
+  });
+  return base.map(r=>{
+    let debeAcum = r.debe, haberAcum = r.haber, saldoAcum = r.saldo;
+    base.forEach(r2=>{
+      if(r2.cuenta.id!==r.cuenta.id && esDescendienteDe(byId, r2.cuenta.id, r.cuenta.id)){
+        debeAcum += r2.debe; haberAcum += r2.haber; saldoAcum += r2.saldo;
+      }
+    });
+    return {...r, debeAcum, haberAcum, saldoAcum};
   });
 }
 
@@ -925,7 +1174,7 @@ async function renderAsientosPage(main){
         <td>${a.id}</td>
         <td>${emp?escapeHtml(emp.nombre):'—'}</td>
         <td>${fmtDate(a.fecha)}</td>
-        <td>${escapeHtml(a.descripcion||'')}</td>
+        <td>${escapeHtml(a.descripcion||'')}${a.origen?' <span class="badge blue" title="Generado automáticamente, no cargado a mano">🤖 Automático</span>':''}</td>
         <td><span class="money pos">${fmtMoney(totalDebe)}</span></td>
         <td><span class="money pos">${fmtMoney(totalHaber)}</span></td>
         <td>${balanceado?'<span class="badge green">Balanceado</span>':'<span class="badge red">Descuadrado</span>'}</td>
@@ -995,7 +1244,7 @@ async function openAsientoForm(existing, empresas){
 
   function cuentasDeEmpresa(){
     const empId = qs('#asi-empresa').value;
-    return cuentas.filter(c=>String(c.empresaId)===String(empId));
+    return ordenarPorJerarquia(cuentas.filter(c=>String(c.empresaId)===String(empId)));
   }
   function centrosDeEmpresa(){
     const empId = qs('#asi-empresa').value;
@@ -1007,10 +1256,13 @@ async function openAsientoForm(existing, empresas){
     const centros = centrosDeEmpresa();
     cont.innerHTML = '';
     lineas.forEach((l,idx)=>{
+      // Sólo se pueden imputar asientos contra cuentas imputables (no de título/familia) —
+      // salvo que la línea ya tuviera cargada una cuenta de título de antes, para no perder el dato.
+      const disponibles = opciones.filter(c=>c.imputable || String(c.id)===String(l.cuentaId));
       const row = el(`<div class="linea-row">
         <select data-idx="${idx}" data-f="cuentaId">
           <option value="">-- Cuenta --</option>
-          ${opciones.map(c=>`<option value="${c.id}" ${String(l.cuentaId)===String(c.id)?'selected':''}>${escapeHtml(c.codigo)} - ${escapeHtml(c.nombre)}</option>`).join('')}
+          ${disponibles.map(c=>`<option value="${c.id}" ${String(l.cuentaId)===String(c.id)?'selected':''}>${'　'.repeat(c._depth)}${escapeHtml(c.codigo)} - ${escapeHtml(c.nombre)}${!c.imputable?' ⚠ (título)':''}</option>`).join('')}
         </select>
         <select data-idx="${idx}" data-f="centroCostoId">
           <option value="">-- Centro de costo --</option>
@@ -1058,6 +1310,8 @@ async function openAsientoForm(existing, empresas){
     const lineasValidas = lineas.filter(l=>l.cuentaId && (Number(l.debe)>0 || Number(l.haber)>0));
     if(lineasValidas.length < 2){ alert('Cargá al menos 2 líneas con cuenta y monto.'); return; }
     if(!balanceado){ alert('El asiento no está balanceado: el total del Debe debe ser igual al total del Haber.'); return; }
+    const conCuentaTitulo = lineasValidas.some(l=>{ const c = cuentas.find(x=>String(x.id)===String(l.cuentaId)); return c && !c.imputable; });
+    if(conCuentaTitulo && !confirm('Alguna línea usa una cuenta de título/familia (no imputable), que normalmente no debería recibir asientos directos — se usa solo para agrupar. ¿Guardar igual?')) return;
     const obj = existing ? {...existing} : {};
     obj.empresaId = Number(qs('#asi-empresa').value);
     obj.fecha = qs('#asi-fecha').value;
@@ -1116,10 +1370,10 @@ async function renderReportesPage(main){
 }
 
 async function drawMayor(cont, empresaId, fecha){
-  const cuentas = (await dbGetAll('planCuentas')).filter(c=>String(c.empresaId)===String(empresaId));
+  const cuentas = ordenarPorJerarquia((await dbGetAll('planCuentas')).filter(c=>String(c.empresaId)===String(empresaId)));
   cont.innerHTML = `<div class="filters"><select id="mayor-cuenta">
       <option value="">-- Elegí una cuenta --</option>
-      ${cuentas.map(c=>`<option value="${c.id}">${escapeHtml(c.codigo)} - ${escapeHtml(c.nombre)}</option>`).join('')}
+      ${cuentas.map(c=>`<option value="${c.id}">${'　'.repeat(c._depth)}${escapeHtml(c.codigo)} - ${escapeHtml(c.nombre)}${!c.imputable?' (título)':''}</option>`).join('')}
     </select></div><div id="mayor-tabla"></div>`;
   qs('#mayor-cuenta').onchange = async ()=>{
     const cuentaId = qs('#mayor-cuenta').value;
@@ -1154,11 +1408,11 @@ async function drawSumasYSaldos(cont, empresaId, fecha){
   const totalAcreedor = saldos.reduce((s,r)=>s+(r.saldo<0?-r.saldo:0),0);
   cont.innerHTML = `<div class="card table-wrap"><table><thead><tr>
       <th>Código</th><th>Cuenta</th><th>Tipo</th><th>Sumas Debe</th><th>Sumas Haber</th><th>Saldo Deudor</th><th>Saldo Acreedor</th></tr></thead>
-      <tbody>${saldos.length ? saldos.map(r=>`<tr>
-        <td>${escapeHtml(r.cuenta.codigo)}</td><td>${escapeHtml(r.cuenta.nombre)}</td><td>${escapeHtml(r.cuenta.tipo)}</td>
-        <td class="money pos">${fmtMoney(r.debe)}</td><td class="money pos">${fmtMoney(r.haber)}</td>
-        <td class="money pos">${r.saldo>0?fmtMoney(r.saldo):'—'}</td>
-        <td class="money pos">${r.saldo<0?fmtMoney(-r.saldo):'—'}</td>
+      <tbody>${saldos.length ? saldos.map(r=>`<tr${!r.cuenta.imputable?' style="font-weight:600;"':''}>
+        <td>${escapeHtml(r.cuenta.codigo)}</td><td>${'　'.repeat(r.depth)}${escapeHtml(r.cuenta.nombre)}${!r.cuenta.imputable?' <span class="badge gray">título</span>':''}</td><td>${escapeHtml(r.cuenta.tipo)}</td>
+        <td class="money pos">${fmtMoney(r.debeAcum)}</td><td class="money pos">${fmtMoney(r.haberAcum)}</td>
+        <td class="money pos">${r.saldoAcum>0?fmtMoney(r.saldoAcum):'—'}</td>
+        <td class="money pos">${r.saldoAcum<0?fmtMoney(-r.saldoAcum):'—'}</td>
         </tr>`).join('') : '<tr><td colspan="7" class="empty">No hay cuentas cargadas para esta empresa.</td></tr>'}
       </tbody>
       ${saldos.length ? `<tr class="total-row"><td colspan="3">TOTALES</td>
@@ -1183,7 +1437,7 @@ async function drawBalanceGeneral(cont, empresaId, fecha){
   const totalPN = pn.reduce((s,r)=>s+r.saldo,0) + resultado;
   function tabla(titulo, rows){
     return `<div class="section-title">${titulo}</div><div class="card table-wrap"><table><tbody>
-      ${rows.length ? rows.map(r=>`<tr><td>${escapeHtml(r.cuenta.nombre)}</td><td class="money pos" style="text-align:right;">${fmtMoney(r.saldo)}</td></tr>`).join('')
+      ${rows.length ? rows.map(r=>`<tr${!r.cuenta.imputable?' style="font-weight:600;"':''}><td>${'　'.repeat(r.depth)}${escapeHtml(r.cuenta.nombre)}</td><td class="money pos" style="text-align:right;">${fmtMoney(r.saldoAcum)}</td></tr>`).join('')
         : '<tr><td class="empty">Sin cuentas</td></tr>'}
       </tbody></table></div>`;
   }
@@ -1213,7 +1467,7 @@ async function drawEstadoResultados(cont, empresaId, fecha){
   const resultado = totalIngresos - totalEgresos;
   function tabla(titulo, rows){
     return `<div class="section-title">${titulo}</div><div class="card table-wrap"><table><tbody>
-      ${rows.length ? rows.map(r=>`<tr><td>${escapeHtml(r.cuenta.nombre)}</td><td class="money pos" style="text-align:right;">${fmtMoney(r.saldo)}</td></tr>`).join('')
+      ${rows.length ? rows.map(r=>`<tr${!r.cuenta.imputable?' style="font-weight:600;"':''}><td>${'　'.repeat(r.depth)}${escapeHtml(r.cuenta.nombre)}</td><td class="money pos" style="text-align:right;">${fmtMoney(r.saldoAcum)}</td></tr>`).join('')
         : '<tr><td class="empty">Sin cuentas</td></tr>'}
       </tbody></table></div>`;
   }
@@ -1615,6 +1869,7 @@ async function renderOPListado(cont, main){
         const f = await dbGet('facturasRecibidas', fid);
         if(f){ f.estado='Pendiente'; await dbPut('facturasRecibidas', f); }
       }
+      if(o.asientoGeneradoId){ await dbDelete('asientos', o.asientoGeneradoId); }
       await dbDelete('ordenesPago', o.id);
       await registrarAuditoria('Eliminar','Órdenes de Pago', o.id, o.numero||'');
       renderOPListado(cont, main);
@@ -1742,10 +1997,12 @@ async function renderOPNueva(cont, main, prefill){
               <input type="text" placeholder="Banco" data-midx="${idx}" data-mf="chequeBanco" value="${escapeHtml(m.chequeBanco||'')}">
               <input type="date" data-midx="${idx}" data-mf="chequeFechaCobro" value="${m.chequeFechaCobro||''}">
             </div>`
-          : `<select data-midx="${idx}" data-mf="cuentaBancariaId">
-              <option value="">-- Banco pagador --</option>
-              ${cuentasBancariasEmpresa.map(cb=>`<option value="${cb.id}" ${String(m.cuentaBancariaId)===String(cb.id)?'selected':''}>${escapeHtml(cb.nombre)}</option>`).join('')}
-            </select>`}
+          : (cuentasBancariasEmpresa.length
+              ? `<select data-midx="${idx}" data-mf="cuentaBancariaId">
+                  <option value="">-- Banco / caja pagador --</option>
+                  ${cuentasBancariasEmpresa.map(cb=>`<option value="${cb.id}" ${String(m.cuentaBancariaId)===String(cb.id)?'selected':''}>${escapeHtml(cb.nombre)}${cb.banco?` — ${escapeHtml(cb.banco)}`:''}</option>`).join('')}
+                </select>`
+              : `<div class="badge orange" style="align-self:center;">⚠ No hay cuentas bancarias cargadas para esta empresa. Cargalas en 🏦 Bancos y Caja → Cuentas Bancarias y Caja.</div>`)}
         <button type="button" class="btn small danger" data-mremove="${idx}">✕</button>
       </div>`;
     }).join('');
@@ -1793,6 +2050,7 @@ async function renderOPNueva(cont, main, prefill){
   qs('#opn-cerrar').onclick = async ()=>{
     if(!facturasSeleccionadas.length){ alert('Seleccioná al menos una factura.'); return; }
     if(!mediosPago.length){ alert('Agregá al menos un medio de pago.'); return; }
+    if(mediosPago.some(m=>m.tipo!=='Cheque' && !m.cuentaBancariaId)){ alert('Falta elegir el banco o la caja para alguno de los medios de pago (Transferencia/Efectivo/Otro).'); return; }
     const balanceado = actualizarTotalPago();
     if(!balanceado){ alert('El total de los medios de pago tiene que coincidir con el Neto a Pagar.'); return; }
 
@@ -1834,6 +2092,15 @@ async function renderOPNueva(cont, main, prefill){
       await dbPut('facturasRecibidas', f);
     }
     await registrarAuditoria('Crear', 'Órdenes de Pago', idOrden, `${numero} — ${fmtMoney(orden.totalNeto)}`);
+
+    const empresa = await dbGet('empresas', empresaId);
+    const idAsientoOP = await generarAsientoOrdenDePago(orden, empresa);
+    if(idAsientoOP){
+      orden.asientoGeneradoId = idAsientoOP;
+      await dbPut('ordenesPago', orden);
+    } else if(empresa && empresa.cuentaProveedoresId){
+      alert('La Orden de Pago se guardó, pero no se pudo generar el asiento contable automático (revisá que todos los bancos/cajas usados tengan una Cuenta contable asociada en 🏦 Bancos y Caja, y que no incluya cheques).');
+    }
 
     await generarPDFyMailOP(orden);
     renderOrdenesPagoPage(main);
