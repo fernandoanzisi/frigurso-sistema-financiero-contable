@@ -8,8 +8,8 @@
 <link rel="manifest" href="manifest.json">
 <link rel="icon" href="icon-192.png">
 <link rel="apple-touch-icon" href="icon-192.png">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/pptxgenjs@3.12.0/dist/pptxgen.bundle.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/pptxgenjs@3.12.0/dist/pptxgen.bundle.js" defer></script>
 <style>
 :root{
   --bg:#0a1420; --bg2:#0e1c2e; --card:#111f33; --card2:#152943;
@@ -17,6 +17,7 @@
   --accent2:#b8942c; --green:#2ecc71; --red:#e74c3c; --blue:#3498db; --purple:#9b59b6;
 }
 *{box-sizing:border-box;}
+html,body{overscroll-behavior-y:contain;}
 body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;
   background:var(--bg); color:var(--text); min-height:100vh;}
 a{color:inherit;}
@@ -138,9 +139,54 @@ tr.total-row td{font-weight:700;border-top:2px solid var(--border);border-bottom
   #main-content{padding:18px 14px 60px;}
   .linea-row{grid-template-columns:1fr;}
 }
+
+/* ═══════════════════════════════════════════════════════════════
+   IDENTIDAD FRIGURSO — solo el splash visual (puro CSS, se va solo).
+   Esta app ya tiene su propio acceso con usuario/contraseña (PBKDF2),
+   así que NO se agrega un candado nuevo — no toca esa lógica ni el
+   splash de "primera vez" propio, que aparece debajo una vez que
+   este se retira.
+   ═══════════════════════════════════════════════════════════════ */
+#fg-splash{
+  position:fixed;inset:0;z-index:9000;background:#0b1220;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;overflow:hidden;
+  animation:fg-splash-out .6s ease 2.8s forwards;
+}
+.fg-sash{
+  position:absolute;width:130vw;height:22vh;max-height:170px;
+  background:linear-gradient(90deg,#d7263d 0%,#d7263d 92%,#5fb0e8 100%);
+  transform:rotate(-22deg) translateX(-140vw);top:46%;left:0;margin-top:-11vh;
+  box-shadow:0 0 60px rgba(215,38,61,.3);
+  animation:fg-sash-sweep 1.3s cubic-bezier(.16,.8,.24,1) both;
+}
+@keyframes fg-sash-sweep{0%{transform:rotate(-22deg) translateX(-140vw);}55%{transform:rotate(-22deg) translateX(0);}100%{transform:rotate(-22deg) translateX(0);}}
+@keyframes fg-splash-out{to{opacity:0;pointer-events:none;visibility:hidden;}}
+.fg-wordmark{
+  position:relative;z-index:5;font-weight:800;font-stretch:condensed;
+  font-size:min(11vw,42px);letter-spacing:.02em;
+  color:#f5f7fa;text-transform:uppercase;
+  opacity:0;transform:translateY(10px);animation:fg-word-in .5s ease .85s both;
+}
+@keyframes fg-word-in{to{opacity:1;transform:translateY(0);}}
+.fg-tagline{
+  position:relative;z-index:5;font-family:monospace;font-size:11px;letter-spacing:.18em;
+  text-transform:uppercase;color:#9fb0cc;margin-top:8px;
+  opacity:0;animation:fg-word-in .5s ease 1.05s both;
+}
+@media (prefers-reduced-motion: reduce){
+  .fg-sash{animation:none;transform:rotate(-22deg) translateX(0);}
+  .fg-wordmark,.fg-tagline{animation:none;opacity:1;transform:none;}
+  #fg-splash{animation-delay:.1s;}
+}
 </style>
 </head>
 <body>
+
+<div id="fg-splash" aria-hidden="true">
+  <div class="fg-sash"></div>
+  <div class="fg-wordmark">Frigurso</div>
+  <div class="fg-tagline">Sistema Financiero</div>
+</div>
 
 <!-- ================= SPLASH (first run) ================= -->
 <div id="splash">
